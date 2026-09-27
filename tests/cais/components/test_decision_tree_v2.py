@@ -1,0 +1,470 @@
+"""Tests for the revised decision tree (decision_tree_v2).
+
+Traversal tests use injected stub verdicts, so no data or API key is needed.
+One integration test binds the real checks to the repo's smoking2 dataset.
+"""
+
+import unittest
+from pathlib import Path
+
+import pandas as pd
+
+from cais.models import AssumptionResult
+from cais.components.decision_tree_v2 import (
+    ALL_CHECK_KEYS,
+    M_DID,
+    M_DID_TIME_WINDOW,
+    M_DIFF_IN_MEANS,
+    M_DIFF_IN_MEANS_ON_ASSIGNMENT,
+    M_DONUT_RDD,
+    M_FRONTDOOR,
+    M_GPS,
+    M_IPW,
+    M_IV,
+    M_OLS_PRE_TREATMENT,
+    M_PSM,
+    M_RDD,
+    M_TRIMMED_IPW,
+    select_method_v2,
+)
+
+
+def stub_checks(**overrides):
+    """Every check passes unless overridden. Overrides are verdicts or callables."""
+    checks = {}
+    for name in ALL_CHECK_KEYS:
+        checks[name] = lambda: AssumptionResult(passed=True, reasoning="stub pass")
+    for name, verdict in overrides.items():
+        if callable(verdict):
+            checks[name] = verdict
+        else:
+            checks[name] = (lambda v=verdict: AssumptionResult(passed=v, reasoning=f"stub {v}"))
+    return checks
+
+
+def base_props(**overrides):
+    props = dict(
+        treatment_variable="t",
+        outcome_variable="y",
+        treatment_variable_type="binary",
+        covariates=["x1"],
+        instrument_variable=None,
+        mediator_variable=None,
+        running_variable=None,
+        cutoff_value=None,
+        time_variable=None,
+        group_variable="unit",
+        is_rct=False,
+        has_temporal_structure=False,
+    )
+    props.update(overrides)
+    return props
+
+
+def run(properties=None, checks=None, **kwargs):
+    return select_method_v2(
+        properties or base_props(),
+        checks=checks or stub_checks(),
+        **kwargs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entry: description, data structure, SUTVA
+# ---------------------------------------------------------------------------
+
+class TestEntry(unittest.TestCase):
+
+    def test_structure_not_supported_ends(self):
+        res = run(base_props(is_structure_supported=False))
+        self.assertTrue(res.ended)
+        self.assertIsNone(res.method)
+        self.assertIn("Data structure", res.end_reason)
+
+    def test_missing_description_warns_and_continues(self):
+        res = run(base_props(has_temporal_structure=True))
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_DID)
+        self.assertTrue(any("description" in w.lower() for w in res.warnings))
+
+    def test_description_via_prompt_callback(self):
+        res = run(
+            base_props(has_temporal_structure=True),
+            prompt_callback=lambda _msg: "Panel of cigarette sales.",
+        )
+        self.assertEqual(res.description, "Panel of cigarette sales.")
+        self.assertTrue(any(s.node == "Prompt user for dataset description" for s in res.steps))
+
+    def test_sutva_false_warns_but_continues(self):
+        res = run(base_props(has_temporal_structure=True), checks=stub_checks(sutva=False))
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_DID)
+        self.assertTrue(any("SUTVA" in w for w in res.warnings))
+
+    def test_sutva_untestable_warns(self):
+        res = run(base_props(has_temporal_structure=True), checks=stub_checks(sutva=None))
+        self.assertFalse(res.ended)
+        self.assertTrue(any("SUTVA" in w for w in res.warnings))
+
+    def test_sutva_prompt_loop_retries_until_tested(self):
+        outcomes = iter([None, True])
+        calls = {"n": 0}
+
+        def sutva():
+            calls["n"] += 1
+            return AssumptionResult(passed=next(outcomes, True), reasoning="stateful stub")
+
+        res = run(
+            base_props(has_temporal_structure=True),
+            checks=stub_checks(sutva=sutva),
+            prompt_callback=lambda _msg: "Units are households in different villages.",
+        )
+        self.assertEqual(calls["n"], 2)
+        self.assertTrue(res.assumptions["sutva"].passed)
+        self.assertEqual(res.method, M_DID)
+
+    def test_sutva_prompt_loop_gives_up_after_three(self):
+        calls = {"n": 0, "prompts": 0}
+
+        def sutva():
+            calls["n"] += 1
+            return AssumptionResult(passed=None, reasoning="always inconclusive")
+
+        def prompt(_msg):
+            calls["prompts"] += 1
+            return "still no useful information"
+
+        res = run(
+            base_props(has_temporal_structure=True),
+            checks=stub_checks(sutva=sutva),
+            prompt_callback=prompt,
+            description="Stub description to skip the description prompt.",
+        )
+        self.assertEqual(calls["n"], 4)  # initial + 3 retries
+        self.assertEqual(calls["prompts"], 3)
+        self.assertFalse(res.ended)
+
+
+# ---------------------------------------------------------------------------
+# RCT branch
+# ---------------------------------------------------------------------------
+
+class TestRCTBranch(unittest.TestCase):
+
+    def test_rct_with_pretreatment_vars_ols(self):
+        res = run(base_props(is_rct=True, covariates=["x1", "x2"]))
+        self.assertEqual(res.method, M_OLS_PRE_TREATMENT)
+
+    def test_rct_without_pretreatment_vars_dim(self):
+        res = run(base_props(is_rct=True, covariates=[], has_pre_treatment_variables=False))
+        self.assertEqual(res.method, M_DIFF_IN_MEANS)
+
+    def test_encouragement_strong_f_assignment_analysis(self):
+        res = run(
+            base_props(is_rct=True, instrument_variable="z", is_encouragement_design=True),
+            checks=stub_checks(iv_relevance=True),
+        )
+        self.assertEqual(res.method, M_DIFF_IN_MEANS_ON_ASSIGNMENT)
+
+    def test_encouragement_weak_f_with_valid_instrument_iv(self):
+        res = run(
+            base_props(is_rct=True, instrument_variable="z", is_encouragement_design=True),
+            checks=stub_checks(iv_relevance=False),
+        )
+        self.assertEqual(res.method, M_IV)
+        self.assertIn("iv_exclusion", res.assumptions)
+        self.assertIn("iv_exogeneity", res.assumptions)
+        self.assertIn("iv_monotonicity", res.assumptions)
+
+    def test_encouragement_weak_f_without_instrument_ends(self):
+        res = run(
+            base_props(is_rct=True, instrument_variable=None, is_encouragement_design=True),
+            checks=stub_checks(iv_relevance=False),
+        )
+        self.assertTrue(res.ended)
+        self.assertIn("Weak instrument", res.end_reason)
+
+    def test_encouragement_relevance_untestable_routes_to_validity(self):
+        res = run(
+            base_props(is_rct=True, instrument_variable="z", is_encouragement_design=True),
+            checks=stub_checks(iv_relevance=None),
+        )
+        self.assertEqual(res.method, M_IV)
+        self.assertTrue(any("relevance" in w.lower() for w in res.warnings))
+
+
+# ---------------------------------------------------------------------------
+# DiD path
+# ---------------------------------------------------------------------------
+
+DID_PROPS = dict(
+    has_temporal_structure=True,
+    time_variable="year",
+    treatment_period_start=1988,
+)
+
+
+class TestDIDPath(unittest.TestCase):
+
+    def test_all_gates_pass_selects_did(self):
+        res = run(base_props(**DID_PROPS))
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_DID)
+        outcomes = {s.node: s.outcome for s in res.steps}
+        self.assertEqual(outcomes["Gate: parallel trends"], "pass")
+        self.assertEqual(outcomes["Gate: no anticipation (placebo)"], "pass")
+
+    def test_composition_gate_fail_ends(self):
+        res = run(base_props(**DID_PROPS), checks=stub_checks(stable_group_composition=False))
+        self.assertTrue(res.ended)
+        self.assertIn("composition", res.end_reason.lower())
+
+    def test_parallel_trends_fail_ends(self):
+        res = run(base_props(**DID_PROPS), checks=stub_checks(parallel_trends=False))
+        self.assertTrue(res.ended)
+        self.assertIn("Parallel trends", res.end_reason)
+
+    def test_baseline_balance_fail_is_advisory(self):
+        res = run(base_props(**DID_PROPS), checks=stub_checks(baseline_outcome_balance=False))
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_DID)
+        self.assertTrue(any("Baseline outcome balance" in w for w in res.warnings))
+
+    def test_no_anticipation_fail_unbounded_ends(self):
+        res = run(base_props(**DID_PROPS), checks=stub_checks(no_anticipation=False))
+        self.assertTrue(res.ended)
+        self.assertIn("Anticipation", res.end_reason)
+
+    def test_no_anticipation_fail_bounded_goes_time_window(self):
+        res = run(
+            base_props(**DID_PROPS, anticipation_known_bounded=True),
+            checks=stub_checks(no_anticipation=False),
+        )
+        self.assertEqual(res.method, M_DID_TIME_WINDOW)
+        self.assertFalse(res.implemented)
+        self.assertTrue(any("not implemented" in w for w in res.warnings))
+
+    def test_untestable_gate_warns_and_continues(self):
+        res = run(base_props(**DID_PROPS), checks=stub_checks(parallel_trends=None))
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_DID)
+        self.assertTrue(any("could not be tested" in w for w in res.warnings))
+
+    def test_no_anticipation_untestable_warns_and_continues(self):
+        res = run(base_props(**DID_PROPS), checks=stub_checks(no_anticipation=None))
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_DID)
+        self.assertTrue(any("No-anticipation" in w for w in res.warnings))
+
+
+# ---------------------------------------------------------------------------
+# RDD path
+# ---------------------------------------------------------------------------
+
+RDD_PROPS = dict(
+    has_temporal_structure=False,
+    running_variable="score",
+    cutoff_value=0.0,
+    covariates=["x1"],
+)
+
+
+class TestRDDPath(unittest.TestCase):
+
+    def test_gates_pass_selects_rdd(self):
+        res = run(base_props(**RDD_PROPS))
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_RDD)
+
+    def test_manipulation_fail_local_goes_donut(self):
+        res = run(
+            base_props(**RDD_PROPS, local_manipulation=True),
+            checks=stub_checks(rdd_no_manipulation=False),
+        )
+        self.assertEqual(res.method, M_DONUT_RDD)
+        self.assertFalse(res.implemented)
+
+    def test_manipulation_fail_no_local_ends(self):
+        res = run(base_props(**RDD_PROPS), checks=stub_checks(rdd_no_manipulation=False))
+        self.assertTrue(res.ended)
+        self.assertIn("manipulation", res.end_reason)
+
+    def test_covariate_continuity_fail_local_goes_donut(self):
+        res = run(
+            base_props(**RDD_PROPS, local_manipulation=True),
+            checks=stub_checks(rdd_covariate_continuity=False),
+        )
+        self.assertEqual(res.method, M_DONUT_RDD)
+
+    def test_untestable_rdd_gate_warns_and_continues(self):
+        res = run(base_props(**RDD_PROPS), checks=stub_checks(rdd_no_manipulation=None))
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_RDD)
+        self.assertTrue(any("RDD gate" in w for w in res.warnings))
+
+
+# ---------------------------------------------------------------------------
+# Identification options: instrument / mediator / backdoor
+# ---------------------------------------------------------------------------
+
+class TestOptions(unittest.TestCase):
+
+    def test_instrument_has_priority(self):
+        res = run(base_props(instrument_variable="z", mediator_variable="m", covariates=["x1"]))
+        self.assertEqual(res.method, M_IV)
+
+    def test_weak_instrument_ends(self):
+        res = run(base_props(instrument_variable="z"), checks=stub_checks(iv_relevance=False))
+        self.assertTrue(res.ended)
+        self.assertIn("Weak instrument", res.end_reason)
+
+    def test_mediator_selects_frontdoor_placeholder(self):
+        res = run(base_props(mediator_variable="m"))
+        self.assertEqual(res.method, M_FRONTDOOR)
+        self.assertFalse(res.implemented)
+
+    def test_mediator_positivity_fail_ends(self):
+        res = run(base_props(mediator_variable="m"), checks=stub_checks(positivity=False))
+        self.assertTrue(res.ended)
+
+    def test_backdoor_balanced_selects_ipw(self):
+        res = run(base_props(), checks=stub_checks(cond_ignorability=True, positivity=True))
+        self.assertEqual(res.method, M_IPW)
+        self.assertIn("balance_after_weighting", res.planned_post_checks)
+
+    def test_backdoor_imbalanced_selects_matching(self):
+        res = run(base_props(), checks=stub_checks(cond_ignorability=False))
+        self.assertEqual(res.method, M_PSM)
+        self.assertIn("balance_after_matching", res.planned_post_checks)
+        self.assertTrue(any(s.node == "Are the covariates in the two groups balanced?" and s.outcome == "No"
+                            for s in res.steps))
+
+    def test_backdoor_positivity_fail_goes_trimmed_ipw(self):
+        res = run(base_props(), checks=stub_checks(positivity=False))
+        self.assertEqual(res.method, M_TRIMMED_IPW)
+        self.assertFalse(res.implemented)
+
+    def test_backdoor_untestable_balance_defaults_to_matching(self):
+        res = run(base_props(), checks=stub_checks(cond_ignorability=None))
+        self.assertEqual(res.method, M_PSM)
+        self.assertTrue(any("balance could not be assessed" in w.lower() for w in res.warnings))
+
+    def test_no_options_available_ends(self):
+        res = run(base_props(covariates=[]))
+        self.assertTrue(res.ended)
+        self.assertIn("No viable identification strategy", res.end_reason)
+
+    def test_nonbinary_backdoor_selects_gps(self):
+        res = run(base_props(treatment_variable_type="continuous", covariates=["x1"]))
+        self.assertEqual(res.method, M_GPS)
+
+    def test_nonbinary_positivity_fail_ends(self):
+        res = run(
+            base_props(treatment_variable_type="continuous", covariates=["x1"]),
+            checks=stub_checks(positivity=False),
+        )
+        self.assertTrue(res.ended)
+        self.assertIn("propensity score", res.end_reason.lower())
+
+    def test_nonbinary_instrument_selects_iv(self):
+        res = run(base_props(treatment_variable_type="continuous", instrument_variable="z"))
+        self.assertEqual(res.method, M_IV)
+
+    def test_nonbinary_no_options_ends(self):
+        res = run(base_props(treatment_variable_type="continuous", covariates=[]))
+        self.assertTrue(res.ended)
+
+
+# ---------------------------------------------------------------------------
+# Propensity-score wiring
+# ---------------------------------------------------------------------------
+
+class TestPropensityWiring(unittest.TestCase):
+
+    def test_propensity_scores_use_covariates_only(self):
+        import numpy as np
+        from cais.models import AssumptionVariables
+        from cais.components.decision_tree_v2 import _fit_propensity_scores
+
+        rng = np.random.default_rng(0)
+        n = 400
+        x = rng.normal(size=n)
+        t = (rng.uniform(size=n) < 0.5).astype(int)  # treatment independent of x
+        df = pd.DataFrame({"t": t, "y": rng.normal(size=n), "x": x})
+        vars = AssumptionVariables(df=df, treatment="t", outcome="y", covariates=["x"])
+
+        ps = _fit_propensity_scores(vars)
+        self.assertEqual(len(ps), n)
+        # If treatment leaked into its own model this would saturate near 0/1.
+        self.assertLess(ps.max(), 0.99)
+        self.assertGreater(ps.min(), 0.01)
+
+
+# ---------------------------------------------------------------------------
+# Result shape
+# ---------------------------------------------------------------------------
+
+class TestResultShape(unittest.TestCase):
+
+    def test_to_dict_is_serializable_and_complete(self):
+        res = run(base_props(**DID_PROPS))
+        d = res.to_dict()
+        for key in ("method", "implemented", "ended", "end_reason", "warnings",
+                    "planned_post_checks", "path", "steps", "assumptions"):
+            self.assertIn(key, d)
+        self.assertIsInstance(d["path"], str)
+        for entry in d["assumptions"].values():
+            for key in ("passed", "reasoning", "details"):
+                self.assertIn(key, entry)
+
+    def test_path_records_key_nodes(self):
+        res = run(base_props(**DID_PROPS))
+        self.assertIn("Is this a randomized trial?", res.path)
+        self.assertIn("Is treatment binary?", res.path)
+        self.assertIn("Is temporal information available?", res.path)
+        self.assertIn("Gate: parallel trends", res.path)
+        self.assertIn(M_DID, res.path)
+
+
+# ---------------------------------------------------------------------------
+# Integration: real checks on the repo's smoking2 data, no LLM needed
+# ---------------------------------------------------------------------------
+
+class TestIntegrationRealChecks(unittest.TestCase):
+
+    def test_smoking2_did_with_default_wiring(self):
+        data_path = Path(__file__).resolve().parents[2] / "test_data" / "smoking2.csv"
+        if not data_path.exists():
+            self.skipTest(f"missing test data: {data_path}")
+
+        df = pd.read_csv(data_path)
+        properties = base_props(
+            treatment_variable="california",
+            outcome_variable="cigsale",
+            covariates=[],
+            time_variable="year",
+            group_variable="state",
+            has_temporal_structure=True,
+            treatment_period_start=1988,
+            is_rct=False,
+        )
+        res = select_method_v2(
+            properties,
+            df=df,
+            description=(
+                "Cigarette sales across US states 1970-2000. California passed "
+                "Proposition 99 in 1988 imposing a tobacco tax."
+            ),
+        )
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_DID)
+        self.assertTrue(res.assumptions["parallel_trends"].passed)
+        self.assertIsNotNone(res.assumptions["parallel_trends"].details.get("p_value"))
+        # placebo period is not available anywhere yet -> inconclusive, warn and continue
+        self.assertIsNone(res.assumptions["no_anticipation"].passed)
+        # LLM checks without an LLM must be inconclusive
+        self.assertIsNone(res.assumptions["sutva"].passed)
+
+
+if __name__ == "__main__":
+    unittest.main()
