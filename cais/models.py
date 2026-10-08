@@ -31,6 +31,38 @@ class LLMRCTCheck(BaseModel):
     is_rct: Optional[bool] = Field(None, description="True if the data is from a randomized controlled trial, False otherwise, None if unsure.")
     reasoning: Optional[str] = Field(None, description="Brief reasoning for the RCT conclusion.")
 
+class LLMDesignContext(BaseModel):
+    """Structured output for the study design context prompt.
+
+    Extracts semantic facts that are not statistically testable: a candidate
+    mediator variable, whether the design is a randomized encouragement
+    design, and the treatment / placebo period starts when the text states
+    them. Everything the text does not support stays None (no guessing).
+    """
+    mediator_variable: Optional[str] = Field(
+        None,
+        description="Column that plausibly carries the treatment's effect to the "
+                    "outcome (sits causally between them). Only if clearly supported; "
+                    "not the treatment or outcome column itself.",
+    )
+    treatment_period_start: Optional[Union[float, int, str]] = Field(
+        None,
+        description="When the treatment/policy begins, in the same units as the "
+                    "time column (e.g. a year). Only if stated in the query or description.",
+    )
+    placebo_period_start: Optional[Union[float, int, str]] = Field(
+        None,
+        description="Start of a pre-treatment period during which the outcome should "
+                    "not yet respond to the treatment. Only if stated or clearly implied.",
+    )
+    is_encouragement_design: Optional[bool] = Field(
+        None,
+        description="True if units were randomized into an encouragement/nudge and "
+                    "actual treatment uptake differs, False if plain randomization "
+                    "or not randomized, None if unsure.",
+    )
+    reasoning: Optional[str] = Field(None, description="Brief justification, or why nothing was extracted.")
+
 class LLMTreatmentReferenceLevel(BaseModel):
     reference_level: Optional[str] = Field(None, description="The identified reference/control level for the treatment variable, if specified in the query. Should be one of the actual values in the treatment column.")
     reasoning: Optional[str] = Field(None, description="Brief reasoning for identifying this reference level.")
@@ -130,6 +162,9 @@ class Variables(BaseModel):
     treat_above_cutoff: Optional[bool] = None
     is_rct: Optional[bool] = Field(False, description="Flag indicating if the dataset is from an RCT.")
     treatment_reference_level: Optional[Union[float, str]] = Field(None, description="The specified reference/control level for a multi-valued treatment variable.")
+    mediator_variable: Optional[str] = Field(None, description="Column plausibly carrying the treatment's effect to the outcome (candidate mediator), if supported by the query or description.")
+    placebo_period_start: Optional[float] = Field(None, description="Start of the pre-treatment placebo period used by the no-anticipation check, if stated.")
+    is_encouragement_design: Optional[bool] = Field(None, description="True if the 'treatment' was a randomized encouragement and uptake differed. None when unsure.")
     interaction_term_suggested: Optional[bool] = Field(False, description="Whether the query or context suggests an interaction term with the treatment might be relevant.")
     interaction_variable_candidate: Optional[str] = Field(None, description="The covariate identified as a candidate for interaction with the treatment.")
     confounders: Optional[List[str]] = Field(default_factory=list)

@@ -29,6 +29,7 @@ from cais.models import (
     LLMTreatmentReferenceLevel,
     LLMInteractionSuggestion, 
     LLMEstimand,
+    LLMDesignContext,
 )
 
 from cais.prompts.method_identification_prompts import (
@@ -41,7 +42,8 @@ from cais.prompts.method_identification_prompts import (
     OUTCOME_VAR_IDENTIFICATION_PROMPT_TEMPLATE,
     COVARIATES_IDENTIFICATION_PROMPT_TEMPLATE, 
     ESTIMAND_PROMPT_TEMPLATE,
-    CONFOUNDER_IDENTIFICATION_PROMPT_TEMPLATE)
+    CONFOUNDER_IDENTIFICATION_PROMPT_TEMPLATE,
+    DESIGN_CONTEXT_IDENTIFICATION_PROMPT_TEMPLATE)
 
 
 
@@ -195,6 +197,75 @@ def identify_interaction_term(llm: Optional[BaseChatModel], treatment_variable: 
     return interaction_term_suggested, interaction_variable_candidate
 
 
+def identify_design_context(llm: Optional[BaseChatModel], query_text: str,
+                            dataset_description: Optional[str], columns: List[str],
+                            column_categories: Dict[str, str],
+                            treatment_variable: Optional[str],
+                            outcome_variable: Optional[str]) -> Dict[str, Any]:
+    """
+    One-shot extraction of semantic design facts (mediator candidate,
+    encouragement design, treatment / placebo period starts).
+
+    These are not statistically testable, so the LLM is instructed to return
+    null for anything the query/description does not support. Returned values
+    are validated against the dataset columns and coerced to numbers.
+    """
+    empty = {
+        "mediator_variable": None,
+        "treatment_period_start": None,
+        "placebo_period_start": None,
+        "is_encouragement_design": None,
+    }
+    if not llm:
+        logger.info("No LLM provided; design context extraction skipped.")
+        return empty
+
+    try:
+        column_info = "\n".join(
+            [f"- '{c}' (Type: {column_categories.get(c, 'Unknown')})" for c in columns]
+        )
+        prompt = DESIGN_CONTEXT_IDENTIFICATION_PROMPT_TEMPLATE.format(
+            query=query_text,
+            description=dataset_description or "N/A",
+            column_info=column_info,
+            treatment=treatment_variable or "N/A",
+            outcome=outcome_variable or "N/A",
+        )
+        result = _call_llm_for_var(llm, prompt, LLMDesignContext)
+        if not result:
+            logger.warning("Design context extraction returned no result.")
+            return empty
+
+        mediator = result.mediator_variable
+        if mediator and (mediator not in columns or mediator in (treatment_variable, outcome_variable)):
+            logger.warning(
+                f"LLM mediator '{mediator}' is not a usable column (or equals treatment/outcome). Ignoring."
+            )
+            mediator = None
+
+        def _coerce_number(value):
+            if value is None:
+                return None
+            try:
+                num = float(value)
+                return int(num) if num == int(num) else num
+            except (TypeError, ValueError):
+                logger.warning(f"Could not interpret period value '{value}' as a number; ignoring.")
+                return None
+
+        design = {
+            "mediator_variable": mediator,
+            "treatment_period_start": _coerce_number(result.treatment_period_start),
+            "placebo_period_start": _coerce_number(result.placebo_period_start),
+            "is_encouragement_design": result.is_encouragement_design,
+        }
+        logger.info(f"Identified design context: {design} (Reason: {result.reasoning})")
+        return design
+    except Exception as e:
+        logger.error(f"Error during design context extraction: {e}")
+        return empty
+
+
 def interpret_query(query_info: Dict[str, Any], dataset_analysis: Dict[str, Any],
                     dataset_description: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -291,6 +362,12 @@ def interpret_query(query_info: Dict[str, Any], dataset_analysis: Dict[str, Any]
     treat_above_cutoff = None
     is_rct = None
     smd_score = None
+    design_context = {
+        "mediator_variable": None,
+        "treatment_period_start": None,
+        "placebo_period_start": None,
+        "is_encouragement_design": None,
+    }
 
     if llm:
         try:
@@ -335,6 +412,17 @@ def interpret_query(query_info: Dict[str, Any], dataset_analysis: Dict[str, Any]
             estimand = "ate" if "ate" in estimand_result.estimand.strip().lower() else "att"
             logger.info(f"LLM identified estimand: {estimand}")
 
+            # Semantic design facts (mediator, encouragement, periods); one-shot,
+            # never guessed. Falls back to all-None on any problem.
+            design_context = identify_design_context(
+                llm, query_text, dataset_description, columns, column_categories,
+                treatment_variable, outcome_variable,
+            )
+            if treatment_time is None:
+                treatment_time = design_context.get("treatment_period_start")
+                if treatment_time is not None:
+                    logger.info(f"Treatment period start from design context: {treatment_time}")
+
 
 
             #smd_score_all = compute_smd(dataset_analysis.get("data", pd.DataFrame()), treatment_variable, usable_covariates)
@@ -346,7 +434,6 @@ def interpret_query(query_info: Dict[str, Any], dataset_analysis: Dict[str, Any]
 
         except Exception as e:
             logger.error(f"Error during LLM checks for IV/RDD/RCT: {e}")
-            
 
 
     # --- Identify Treatment Reference Level --- 
@@ -387,7 +474,11 @@ def interpret_query(query_info: Dict[str, Any], dataset_analysis: Dict[str, Any]
         ## for heterogeneous effects
         "interaction_term_suggested": interaction_term_suggested,
         "interaction_variable_candidate": interaction_variable_candidate, 
-        "confounders": confounders}
+        "confounders": confounders,
+        ## semantic design facts (decision tree v2)
+        "mediator_variable": design_context.get("mediator_variable"),
+        "placebo_period_start": design_context.get("placebo_period_start"),
+        "is_encouragement_design": design_context.get("is_encouragement_design"),}
 
 def compute_smd(df: pd.DataFrame, treat, covars_list) -> Dict[str, float]:
     """

@@ -54,6 +54,7 @@ class _LLMAssumptionVerdict(BaseModel):
     )
 
 
+
 def _llm_argue_assumption(
     assumption_name: str,
     assumption_description: str,
@@ -311,7 +312,15 @@ def check_no_anticipation(vars: AssumptionVariables) -> AssumptionResult:
         return AssumptionResult(
             passed=None,
             reasoning="placebo_period_start or treatment_period_start not provided.",
-            details={},
+            details={
+                "missing_info": (
+                    "Does a pre-treatment period exist during which the outcome should "
+                    "not yet respond to the treatment (a placebo period)? State when it "
+                    "starts and when the treatment begins, in the same units as the time "
+                    "column (e.g. a year), best as 'placebo=<year>, treatment=<year>'. "
+                    "Type 'skip' if unknown."
+                ),
+            },
         )
     if t_placebo >= t0:
         return AssumptionResult(

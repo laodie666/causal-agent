@@ -402,3 +402,50 @@ Respond ONLY with a JSON object adhering to this Pydantic model:
     "reasoning": "string_or_null_brief_explanation"
 }}
 """
+DESIGN_CONTEXT_IDENTIFICATION_PROMPT_TEMPLATE = """
+You are a causal inference expert.
+You need to extract study-design facts from the user query and dataset
+description. These facts are semantic (they depend on what the variables
+MEAN, not on their statistical properties), so only report what the query or
+description explicitly supports. Never guess: if the text does not settle a
+field, return null for it.
+
+User Query: "{query}"
+Dataset Description: {description}
+Treatment: {treatment}
+Outcome: {outcome}
+Available Columns: {column_info}
+
+Fields to extract:
+
+1. mediator_variable
+   A column that plausibly carries the treatment's effect to the outcome
+   (a causal pathway T -> M -> Y). It must be an available column and must
+   not be the treatment or the outcome itself. Only report it if the query
+   or description describes such a mechanism. Return null otherwise.
+   Example: "ad exposure" mediating the effect of a marketing campaign on sales.
+
+2. treatment_period_start
+   When the treatment/policy begins, in the same units as the time column
+   (e.g. a year like 1988). Only if stated or clearly implied by the text.
+
+3. placebo_period_start
+   The start of a pre-treatment period during which the outcome should not
+   yet respond to the treatment (an anticipation-free placebo window).
+   Only if the text states or clearly implies one.
+
+4. is_encouragement_design
+   true ONLY if units were randomized into an encouragement or nudge, while
+   the actual treatment uptake was left to the units (encouragement differs
+   from uptake). false if the design is plain randomization or clearly not
+   randomized. null otherwise. True encouragement designs are rare.
+
+Respond ONLY with a JSON object adhering to this Pydantic model:
+{{
+    "mediator_variable": "column_name_or_null",
+    "treatment_period_start": "number_or_null",
+    "placebo_period_start": "number_or_null",
+    "is_encouragement_design": true_or_false_or_null,
+    "reasoning": "brief_justification_or_why_nothing_was_extracted"
+}}
+"""

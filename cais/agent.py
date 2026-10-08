@@ -191,19 +191,20 @@ class CausalAgent():
             "treatment_variable_type": variables.treatment_variable_type,
             "covariates": covariates,
             "instrument_variable": variables.instrument_variable,
-            "mediator_variable": None,          # not produced by the query interpreter yet
+            "mediator_variable": getattr(variables, "mediator_variable", None),
             "running_variable": variables.running_variable,
             "cutoff_value": variables.cutoff_value,
             "time_variable": variables.time_variable,
             "group_variable": variables.group_variable,
             "treatment_period_start": variables.treatment_time,
-            "placebo_period_start": None,       # not produced yet
+            "placebo_period_start": getattr(variables, "placebo_period_start", None),
             "is_rct": bool(variables.is_rct),
             "has_temporal_structure": has_temporal,
-            "is_encouragement_design": None,    # inferred from the instrument by the tree
+            "is_encouragement_design": getattr(variables, "is_encouragement_design", None),
+            # None -> the tree infers it from an instrument being present
             "has_pre_treatment_variables": bool(covariates),
             "has_valid_instrument": bool(variables.instrument_variable),
-            "has_candidate_mediator": False,    # no mediator detection yet
+            "has_candidate_mediator": None,     # tree falls back to mediator_variable
             "has_valid_backdoor_set": bool(covariates),
             "is_structure_supported": True,
             "anticipation_known_bounded": False,
@@ -418,7 +419,9 @@ class CausalAgent():
         }
     
     def run_analysis(self, query, llm_method_selection: Optional[bool] = True,
-                     method_selection: str = "tree_v2"):
+                     method_selection: str = "tree_v2",
+                     prompt_callback: Optional[Any] = None,
+                     interactive: bool = True):
 
         logger.info("[Causal AI Scientist Stage 1] - Dataset and Query analysis")
 
@@ -434,7 +437,8 @@ class CausalAgent():
             )
         else:
             tree_result = self.select_method_v2(
-                query=query
+                query=query,
+                prompt_callback=prompt_callback if interactive else None,
             )
             if tree_result.ended or not tree_result.implemented:
                 logger.info("Decision tree v2 stopped: %s", tree_result.end_reason or tree_result.method)

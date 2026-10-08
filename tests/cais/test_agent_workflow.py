@@ -141,6 +141,19 @@ class TestDecisionTreeV2Wiring(unittest.TestCase):
         self.assertIsNone(props["mediator_variable"])
         self.assertIsNone(props["placebo_period_start"])
 
+    def test_tree_properties_map_new_design_fields(self):
+        agent = self._make_agent()
+        agent.variables.mediator_variable = "mediator"
+        agent.variables.placebo_period_start = 1986.0
+        agent.variables.is_encouragement_design = True
+
+        props = agent._tree_properties()
+
+        self.assertEqual(props["mediator_variable"], "mediator")
+        self.assertEqual(props["placebo_period_start"], 1986.0)
+        self.assertIsNone(props["has_candidate_mediator"])  # tree falls back to mediator_variable
+        self.assertTrue(props["is_encouragement_design"])
+
     @patch('cais.agent.run_decision_tree_v2')
     def test_select_method_v2_records_result(self, mock_tree):
         agent = self._make_agent()
@@ -230,6 +243,22 @@ class TestDecisionTreeV2Wiring(unittest.TestCase):
         agent.select_controls.assert_not_called()
         agent.clean_dataset.assert_not_called()
         agent.execute_method.assert_not_called()
+
+    @patch('cais.agent.run_decision_tree_v2')
+    def test_interactive_flag_controls_prompt_callback(self, mock_tree):
+        mock_tree.return_value = TreeResult(method="difference_in_differences", implemented=True)
+        agent = self._make_agent()
+        agent.analyse_dataset = MagicMock()
+        agent.select_controls = MagicMock()
+        agent.clean_dataset = MagicMock()
+        agent.execute_method = MagicMock(return_value={"results": {}, "explanation": "ok"})
+        callback = MagicMock(return_value="answer")
+
+        agent.run_analysis("q", prompt_callback=callback)  # interactive defaults to True
+        self.assertIs(mock_tree.call_args.kwargs["prompt_callback"], callback)
+
+        agent.run_analysis("q", prompt_callback=callback, interactive=False)
+        self.assertIsNone(mock_tree.call_args.kwargs["prompt_callback"])
 
     @patch('cais.agent.run_decision_tree_v2')
     def test_run_analysis_continues_for_implemented_leaf(self, mock_tree):

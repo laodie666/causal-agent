@@ -24,6 +24,7 @@ debugged after the fact.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -96,12 +97,54 @@ DESCRIPTION_PROMPT = (
     "Please provide a brief description of the dataset (columns, context, background). "
     "Type 'skip' to continue without one."
 )
-SUTVA_PROMPT = (
-    "The SUTVA assessment is inconclusive. Please add any information about interference "
-    "between units or variation in how the treatment was administered. Type 'skip' to continue."
-)
 
-MAX_PROMPTS = 3
+MAX_PROMPTS = 3  # per-node cap on follow-up questions
+MAX_TOTAL_ASKS = 3  # global cap per run, shared by every asking node (SUTVA included)
+
+_PERIOD_TOKEN_RE = re.compile(
+    r"(?P<kind>placebo|treatment)\s*(?:period[_ ]?start)?\s*[:=]\s*(?P<num>-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def extract_period_starts(answer: str, current: Dict[str, Any]) -> Dict[str, float]:
+    """Parse the no-anticipation question's answer into period starts.
+
+    The user is asked for the placebo/treatment period starts; prose alone
+    cannot rewind a statistical check, so the numbers are parsed out. Named
+    tokens ('placebo=1986', 'treatment=1988') win; otherwise with two or more
+    distinct numbers the smaller is placebo and the larger is the treatment
+    start, and a single number fills whichever of the two is missing.
+
+    Returns only assignments for keys that are currently missing; explicit
+    existing values are never overridden. Returns {} when nothing can be
+    attributed confidently.
+    """
+    parsed: Dict[str, float] = {}
+    for match in _PERIOD_TOKEN_RE.finditer(answer or ""):
+        key = "placebo_period_start" if match.group("kind").lower() == "placebo" else "treatment_period_start"
+        try:
+            parsed[key] = float(match.group("num"))
+        except ValueError:
+            continue
+    if not parsed:
+        unique = sorted({float(x) for x in _NUMBER_RE.findall(answer or "")})
+        if len(unique) >= 2:
+            parsed = {"placebo_period_start": unique[0], "treatment_period_start": unique[-1]}
+        elif len(unique) == 1:
+            have_placebo = current.get("placebo_period_start") is not None
+            have_treatment = current.get("treatment_period_start") is not None
+            if not have_placebo and have_treatment:
+                parsed = {"placebo_period_start": unique[0]}
+            elif not have_treatment and have_placebo:
+                parsed = {"treatment_period_start": unique[0]}
+            # both missing (or both known) with one number -> ambiguous; skip
+    assignments: Dict[str, float] = {}
+    for key, value in parsed.items():
+        if current.get(key) is None:
+            assignments[key] = value
+    return assignments
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +168,7 @@ class TreeResult:
     method: Optional[str] = None
     variant: Optional[str] = None
     implemented: bool = True
+    asks_used: int = 0  # follow-up questions asked to reach this result
     ended: bool = False
     end_reason: Optional[str] = None
     steps: List[TreeStep] = field(default_factory=list)
@@ -142,6 +186,7 @@ class TreeResult:
             "method": self.method,
             "variant": self.variant,
             "implemented": self.implemented,
+            "asks_used": self.asks_used,
             "ended": self.ended,
             "end_reason": self.end_reason,
             "warnings": list(self.warnings),
@@ -186,6 +231,7 @@ class _Traversal:
 
         self.checks = self.factory(self.description)
         self.result = TreeResult(description=self.description)
+        self.asks_used = 0  # follow-up questions asked so far (global budget)
 
     # -- recording helpers ------------------------------------------------
 
@@ -248,14 +294,85 @@ class _Traversal:
         return passed
 
     def gate(self, node: str, check_name: str, fail_reason: str) -> bool:
-        """Run a gate. Returns True when traversal may continue."""
+        """Run a gate. Returns True when traversal may continue.
+
+        If the check reports that user-side knowledge could settle it
+        (``details.missing_info``), the user is asked before the verdict is
+        final; statistical failures carry no question and never ask.
+        """
         passed = self.checked(node, check_name, "gate")
+        passed = self._maybe_reask_gate(node, check_name, "gate", passed)
         if passed is False:
             self.end(fail_reason)
             return False
         if passed is None:
             self.result.warnings.append(f"{node}: could not be tested; continuing with warning.")
         return True
+
+    # -- follow-up questions (SUTVA-style, budgeted) -----------------------
+
+    def _question_of(self, check_name: str) -> Optional[str]:
+        """The check's own question, when it needs information a user could give."""
+        res = self.result.assumptions.get(check_name)
+        if res is None:
+            return None
+        return (res.details or {}).get("missing_info")
+
+    def _ask_and_rerun(self, node: str, check_name: str, kind: str) -> Optional[bool]:
+        """Ask the user the check's question, re-run the check, record the trace.
+
+        Up to MAX_PROMPTS asks for this node, subject to the shared global
+        budget. Stops on a verdict, no answer, or budget exhaustion.
+        """
+        attempts = 0
+        passed = None
+        while attempts < MAX_PROMPTS and self.asks_used < MAX_TOTAL_ASKS:
+            question = self._question_of(check_name)
+            if not question:
+                break
+            answer = self._prompt(question)
+            if not answer:
+                self.step(node, "process", "no user answer", f"question: {question}")
+                break
+            self.asks_used += 1
+            attempts += 1
+            self.description = (self.description or "") + "\n" + answer
+            # Statistical checks need numbers, not prose: for the no-anticipation
+            # gate, parse period starts out of the answer (only fills missing
+            # values; what was parsed is recorded in the trace).
+            if check_name == "no_anticipation":
+                parsed = extract_period_starts(answer, self.props)
+                if parsed:
+                    self.props.update(parsed)
+                    self.step(
+                        node, "process", "parsed period starts",
+                        ", ".join(f"{k}={v:g}" for k, v in sorted(parsed.items())),
+                    )
+            self.checks = self.factory(self.description)
+            self.step(node, "process", f"answered ({self.asks_used}/{MAX_TOTAL_ASKS})", f"question: {question}")
+            redone = self._safe_check(check_name)
+            self.result.assumptions[check_name] = redone
+            outcome = {True: "pass", False: "fail", None: "can't tell"}[redone.passed]
+            self.step(node, kind, f"after answer: {outcome}", redone.reasoning)
+            passed = redone.passed
+            if redone.passed is not None:
+                break
+        return passed
+
+    def _maybe_reask_gate(self, node: str, check_name: str, kind: str, passed: Optional[bool]) -> Optional[bool]:
+        """Gates only: if the check needs user knowledge, ask for it."""
+        if passed is not None and passed is not False:
+            return passed
+        if not self._question_of(check_name):
+            return passed  # statistical fails/can't-tells are facts, not questions
+        if self.prompt_callback is None:
+            self.step(node, "process", "no user available (batch)", "")
+            return passed
+        if self.asks_used >= MAX_TOTAL_ASKS:
+            self.step(node, "process", "ask budget exhausted", "")
+            return passed
+        retried = self._ask_and_rerun(node, check_name, kind)
+        return passed if retried is None else retried
 
     def _prompt(self, message: str) -> Optional[str]:
         if self.prompt_callback is None:
@@ -281,6 +398,7 @@ class _Traversal:
             else:
                 self._observational_branch()
         self.result.description = self.description
+        self.result.asks_used = self.asks_used
         return self.result
 
     def _entry(self) -> None:
@@ -308,16 +426,22 @@ class _Traversal:
             self.end("Data structure not supported (e.g. survival data, competing risks).")
             return
 
-        # 3. global SUTVA advisory (can't tell -> ask for info, max 3 prompts)
-        attempts = 0
+        # 3. global SUTVA advisory. Asking follows the same rule as gates:
+        #    only when the check itself supplies a question (missing_info);
+        #    without an LLM there is nothing that could use an answer.
         passed = self.checked("Advisory: SUTVA", "sutva", "advisory")
-        while passed is None and attempts < MAX_PROMPTS:
-            answer = self._prompt(SUTVA_PROMPT)
-            if not answer:
+        for _ in range(MAX_PROMPTS):
+            question = self._question_of("sutva")
+            if passed is not None or not question or self.asks_used >= MAX_TOTAL_ASKS:
                 break
+            answer = self._prompt(question)
+            if not answer:
+                self.step("Advisory: SUTVA", "process", "no user answer", f"question: {question}")
+                break
+            self.asks_used += 1
+            self.step("Advisory: SUTVA", "process", f"answered ({self.asks_used}/{MAX_TOTAL_ASKS})", f"question: {question}")
             self.description = (self.description or "") + "\n" + answer
             self.checks = self.factory(self.description)
-            attempts += 1
             passed = self.checked("Advisory: SUTVA", "sutva", "advisory")
         if passed is False:
             self.result.warnings.append("SUTVA assessment failed (advisory); possible interference.")
@@ -385,6 +509,9 @@ class _Traversal:
             return
 
         anticipation = self.checked("Gate: no anticipation (placebo)", "no_anticipation", "gate")
+        anticipation = self._maybe_reask_gate(
+            "Gate: no anticipation (placebo)", "no_anticipation", "gate", anticipation
+        )
         if anticipation is False:
             if self.props.get("anticipation_known_bounded", False):
                 self.leaf(M_DID_TIME_WINDOW)

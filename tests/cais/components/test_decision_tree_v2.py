@@ -7,11 +7,14 @@ One integration test binds the real checks to the repo's smoking2 dataset.
 import unittest
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from cais.models import AssumptionResult
 from cais.components.decision_tree_v2 import (
     ALL_CHECK_KEYS,
+    build_default_checks,
+    extract_period_starts,
     M_DID,
     M_DID_TIME_WINDOW,
     M_DIFF_IN_MEANS,
@@ -60,10 +63,13 @@ def base_props(**overrides):
     return props
 
 
-def run(properties=None, checks=None, **kwargs):
+def run(properties=None, checks=None, checks_factory=None, **kwargs):
+    if checks is None and checks_factory is None:
+        checks = stub_checks()  # default: everything passes
     return select_method_v2(
         properties or base_props(),
-        checks=checks or stub_checks(),
+        checks=checks,
+        checks_factory=checks_factory,
         **kwargs,
     )
 
@@ -106,20 +112,29 @@ class TestEntry(unittest.TestCase):
         self.assertTrue(any("SUTVA" in w for w in res.warnings))
 
     def test_sutva_prompt_loop_retries_until_tested(self):
-        outcomes = iter([None, True])
         calls = {"n": 0}
 
-        def sutva():
+        def make_checks(desc):
+            if desc and "villages" in desc:
+                sutva = lambda: AssumptionResult(passed=True, reasoning="resolvable with the answer")
+            else:
+                sutva = lambda: AssumptionResult(
+                    passed=None,
+                    reasoning="inconclusive",
+                    details={"missing_info": "How are units arranged (households, villages, network)?"},
+                )
             calls["n"] += 1
-            return AssumptionResult(passed=next(outcomes, True), reasoning="stateful stub")
+            return stub_checks(sutva=sutva, no_anticipation=True, parallel_trends=True)
 
         res = run(
             base_props(has_temporal_structure=True),
-            checks=stub_checks(sutva=sutva),
+            checks_factory=make_checks,
             prompt_callback=lambda _msg: "Units are households in different villages.",
+            description="Panel of outcomes.",
         )
-        self.assertEqual(calls["n"], 2)
+        self.assertEqual(calls["n"], 2)  # initial + retry after the answer
         self.assertTrue(res.assumptions["sutva"].passed)
+        self.assertEqual(res.asks_used, 1)
         self.assertEqual(res.method, M_DID)
 
     def test_sutva_prompt_loop_gives_up_after_three(self):
@@ -127,7 +142,11 @@ class TestEntry(unittest.TestCase):
 
         def sutva():
             calls["n"] += 1
-            return AssumptionResult(passed=None, reasoning="always inconclusive")
+            return AssumptionResult(
+                passed=None,
+                reasoning="always inconclusive",
+                details={"missing_info": "Describe any interference between units."},
+            )
 
         def prompt(_msg):
             calls["prompts"] += 1
@@ -135,13 +154,221 @@ class TestEntry(unittest.TestCase):
 
         res = run(
             base_props(has_temporal_structure=True),
-            checks=stub_checks(sutva=sutva),
+            checks=stub_checks(sutva=sutva, parallel_trends=True),
             prompt_callback=prompt,
             description="Stub description to skip the description prompt.",
         )
         self.assertEqual(calls["n"], 4)  # initial + 3 retries
         self.assertEqual(calls["prompts"], 3)
         self.assertFalse(res.ended)
+
+    def test_sutva_without_question_never_asks_even_interactively(self):
+        # no LLM: the check is can't tell with no question, so a wired user
+        # must NOT be prompted and the ask budget must stay untouched
+        res = run(
+            base_props(has_temporal_structure=True),
+            checks=stub_checks(sutva=None, parallel_trends=True),
+            prompt_callback=lambda _msg: "anything",
+            description="Stub description to skip the description prompt.",
+        )
+        self.assertFalse(res.ended)
+        self.assertEqual(res.asks_used, 0)
+
+
+# ---------------------------------------------------------------------------
+# Gate follow-up questions (SUTVA-style loop generalized to gates, budgeted)
+# ---------------------------------------------------------------------------
+
+class TestGateReaskLoop(unittest.TestCase):
+
+    def _did_props(self):
+        return base_props(has_temporal_structure=True)
+
+    def test_gate_question_asks_then_passes(self):
+        prompts = {"n": 0}
+
+        def make_checks(desc):
+            if desc and "1990" in desc:
+                na = AssumptionResult(passed=True, reasoning="placebo test ran with the provided periods")
+            else:
+                na = AssumptionResult(
+                    passed=None,
+                    reasoning="periods unknown",
+                    details={"missing_info": "When does the placebo period and treatment start?"},
+                )
+            return stub_checks(sutva=True, parallel_trends=True, no_anticipation=lambda: na)
+
+        def prompt(msg):
+            prompts["n"] += 1
+            if "placebo" in msg.lower():
+                return "placebo starts 1990, treatment starts 2000"
+            return "Panel of cigarette sales across states."
+
+        res = run(
+            self._did_props(),
+            checks_factory=make_checks,
+            prompt_callback=prompt,
+            description="Panel of cigarette sales across states.",
+        )
+
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_DID)
+        self.assertTrue(res.assumptions["no_anticipation"].passed)
+        self.assertEqual(res.asks_used, 1)
+        self.assertEqual(prompts["n"], 1)  # only the gate question; description was given
+        self.assertTrue(any(s.kind == "process" and "answered" in s.outcome for s in res.steps))
+        self.assertFalse(any("No-anticipation" in w for w in res.warnings))
+
+    def test_ask_budget_shared_with_sutva(self):
+        prompts = {"n": 0}
+
+        def make_checks(_desc):
+            return stub_checks(
+                sutva=lambda: AssumptionResult(
+                    passed=None,
+                    reasoning="inconclusive",
+                    details={"missing_info": "Describe any interference between units."},
+                ),
+                parallel_trends=True,
+                no_anticipation=lambda: AssumptionResult(
+                    passed=None,
+                    reasoning="periods unknown",
+                    details={"missing_info": "When does the placebo period start?"},
+                ),
+            )
+
+        def prompt(_msg):
+            prompts["n"] += 1
+            return "irrelevant answer, SUTVA stays inconclusive"
+
+        res = run(
+            self._did_props(),
+            checks_factory=make_checks,
+            prompt_callback=prompt,
+            description="Skip the description prompt.",
+        )
+
+        # SUTVA consumed the whole global budget (3 asks); the gate may not ask
+        self.assertEqual(prompts["n"], 3)
+        self.assertIsNone(res.assumptions["no_anticipation"].passed)
+        self.assertTrue(any("ask budget exhausted" in s.outcome for s in res.steps))
+        self.assertTrue(any("No-anticipation" in w for w in res.warnings))
+
+    def test_gate_fail_with_question_asks_then_ends(self):
+        prompts = {"n": 0}
+
+        def make_checks(desc):
+            if desc and "no major attrition" in desc:
+                comp = AssumptionResult(passed=False, reasoning="still unstable after answer")
+            else:
+                comp = AssumptionResult(
+                    passed=False,
+                    reasoning="attrition suspected",
+                    details={"missing_info": "Describe any group membership changes over time."},
+                )
+            return stub_checks(sutva=True, parallel_trends=True, no_anticipation=None,
+                               stable_group_composition=lambda: comp)
+
+        def prompt(_msg):
+            prompts["n"] += 1
+            return "no major attrition occurs"
+
+        res = run(
+            self._did_props(),
+            checks_factory=make_checks,
+            prompt_callback=prompt,
+            description="Panel of cigarette sales across states.",
+        )
+
+        self.assertTrue(res.ended)
+        self.assertIsNone(res.method)
+        self.assertIn("Group composition", res.end_reason)
+        self.assertEqual(res.asks_used, 1)
+        self.assertEqual(prompts["n"], 1)
+
+    def test_gate_can_tell_without_question_never_asks(self):
+        prompts = {"n": 0}
+
+        res = run(
+            self._did_props(),
+            checks=stub_checks(sutva=True, parallel_trends=lambda: AssumptionResult(passed=None, reasoning="insufficient pre data")),
+            prompt_callback=lambda _m: prompts.__setitem__("n", prompts["n"] + 1) or "answer",
+            description="Skip the description prompt.",
+        )
+
+        # statistical can't-tell has no question -> no ask, old behavior
+        self.assertEqual(prompts["n"], 0)
+        self.assertFalse(res.ended)
+        self.assertTrue(any("Gate: parallel trends" in w for w in res.warnings))
+
+    def test_answer_with_period_numbers_unblocks_real_no_anticipation(self):
+        """Real checks end to end: the parsed numbers must re-run the placebo test.
+
+        Uses the production default wiring (build_default_checks) because the
+        answer is meant to update the traversal's props, which the default
+        factory reads live. Pre-treatment noise is tiny so the parallel-trends
+        gate cannot fail by chance.
+        """
+        rng = np.random.default_rng(11)
+        rows = []
+        for unit, treated in (("a", 0), ("b", 0), ("c", 1), ("d", 1)):
+            for year in range(1970, 2001):
+                rows.append(dict(
+                    unit=unit,
+                    year=year,
+                    treated_group=treated,
+                    # a real post-1988 effect makes this a sensible DiD; the
+                    # placebo window (1980-1987) has no group-specific pattern
+                    y=10 + 0.3 * (year - 1970) + 0.2 * treated * (year >= 1988)
+                    + rng.normal(0, 1.0),
+                ))
+        df = pd.DataFrame(rows)
+        props = self._did_props()
+        props.update(
+            treatment_variable="treated_group",
+            outcome_variable="y",
+            covariates=[],
+            time_variable="year",
+            group_variable="unit",
+            treatment_period_start=1988,
+        )
+
+        def prompt(_msg):
+            return "placebo=1980, treatment=1988"
+
+        res = select_method_v2(
+            props,
+            df=df,
+            prompt_callback=prompt,
+            description="Panel of outcomes for four units, treatment starts 1988.",
+        )
+
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_DID)
+        # the answer was parsed into the missing placebo period and the real
+        # placebo test ran; before the ask it was always can't tell
+        self.assertEqual(res.asks_used, 1)
+        self.assertTrue(any("parsed period starts" in s.outcome for s in res.steps))
+        self.assertIsNotNone(res.assumptions["no_anticipation"].passed)
+        self.assertIn("Placebo treatment effect", res.assumptions["no_anticipation"].reasoning)
+
+    def test_batch_run_with_gate_question_skips_asking(self):
+        res = run(
+            self._did_props(),
+            checks=stub_checks(
+                sutva=True,
+                parallel_trends=True,
+                no_anticipation=lambda: AssumptionResult(
+                    passed=None, reasoning="periods unknown",
+                    details={"missing_info": "When does the placebo period start?"},
+                ),
+            ),
+        )
+
+        self.assertFalse(res.ended)
+        self.assertIsNone(res.assumptions["no_anticipation"].passed)
+        self.assertTrue(any("no user available" in s.outcome for s in res.steps))
+        self.assertEqual(res.asks_used, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +625,41 @@ class TestPropensityWiring(unittest.TestCase):
         # If treatment leaked into its own model this would saturate near 0/1.
         self.assertLess(ps.max(), 0.99)
         self.assertGreater(ps.min(), 0.01)
+
+
+# ---------------------------------------------------------------------------
+# Period parsing for the no-anticipation follow-up question
+# ---------------------------------------------------------------------------
+
+class TestExtractPeriodStarts(unittest.TestCase):
+
+    def test_named_tokens_win(self):
+        parsed = extract_period_starts("placebo=1986, treatment=1988", {})
+        self.assertEqual(parsed, {"placebo_period_start": 1986.0, "treatment_period_start": 1988.0})
+
+    def test_named_tokens_do_not_override_known_values(self):
+        parsed = extract_period_starts(
+            "placebo=1986, treatment=1950", {"treatment_period_start": 1988}
+        )
+        self.assertEqual(parsed, {"placebo_period_start": 1986.0})
+
+    def test_two_plain_numbers_assign_by_size(self):
+        parsed = extract_period_starts("it ran from 1986 and effects could start 1988", {})
+        self.assertEqual(parsed["placebo_period_start"], 1986.0)
+        self.assertEqual(parsed["treatment_period_start"], 1988.0)
+
+    def test_single_number_fills_only_missing_field(self):
+        parsed = extract_period_starts("1986", {"treatment_period_start": 1988})
+        self.assertEqual(parsed, {"placebo_period_start": 1986.0})
+
+    def test_single_number_with_both_missing_is_ambiguous(self):
+        self.assertEqual(extract_period_starts("1986", {}), {})
+
+    def test_garbage_returns_empty(self):
+        self.assertEqual(extract_period_starts("no idea at all", {}), {})
+
+    def test_skip_is_empty(self):
+        self.assertEqual(extract_period_starts("", {}), {})
 
 
 # ---------------------------------------------------------------------------

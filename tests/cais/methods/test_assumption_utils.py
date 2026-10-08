@@ -258,6 +258,9 @@ class TestCheckNoAnticipation(unittest.TestCase):
         r = check_no_anticipation(v)
         self.assertIsInstance(r, AssumptionResult)
         self.assertIsNone(r.passed)
+        # the check must state its question so an interactive run can ask the user
+        self.assertIn("missing_info", r.details)
+        self.assertIn("placebo", r.details["missing_info"].lower())
 
     def test_placebo_period_after_treatment_returns_false(self):
         df = _make_did_df()
