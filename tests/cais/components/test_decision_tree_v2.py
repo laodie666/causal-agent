@@ -15,7 +15,6 @@ from cais.components.decision_tree_v2 import (
     M_DID,
     M_DID_TIME_WINDOW,
     M_DIFF_IN_MEANS,
-    M_DIFF_IN_MEANS_ON_ASSIGNMENT,
     M_DONUT_RDD,
     M_FRONTDOOR,
     M_GPS,
@@ -164,7 +163,8 @@ class TestRCTBranch(unittest.TestCase):
             base_props(is_rct=True, instrument_variable="z", is_encouragement_design=True),
             checks=stub_checks(iv_relevance=True),
         )
-        self.assertEqual(res.method, M_DIFF_IN_MEANS_ON_ASSIGNMENT)
+        self.assertEqual(res.method, M_DIFF_IN_MEANS)
+        self.assertEqual(res.variant, "on_assignment")
 
     def test_encouragement_weak_f_with_valid_instrument_iv(self):
         res = run(

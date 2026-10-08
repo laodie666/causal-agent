@@ -32,12 +32,13 @@ from cais.models import AssumptionResult
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Leaf identifiers. Names are draft-faithful; mapping to executable methods is
-# a separate concern (executor/estimator unification happens later).
+# Leaf identifiers. Implemented leaves use the executor names from
+# cais.methods.METHOD_MAPPING verbatim, so the tree result can be executed
+# directly. Unimplemented variants keep descriptive names and are flagged in
+# LEAF_IMPLEMENTED; they become base-method + options once implemented.
 # ---------------------------------------------------------------------------
-M_OLS_PRE_TREATMENT = "linear_regression_with_pre_treatment_variables"
+M_OLS_PRE_TREATMENT = "linear_regression"
 M_DIFF_IN_MEANS = "diff_in_means"
-M_DIFF_IN_MEANS_ON_ASSIGNMENT = "diff_in_means_on_assignment"
 M_IV = "instrumental_variable"
 M_DID = "difference_in_differences"
 M_DID_TIME_WINDOW = "difference_in_differences_time_window"
@@ -54,7 +55,6 @@ M_GPS = "generalized_propensity_score"
 LEAF_IMPLEMENTED: Dict[str, bool] = {
     M_OLS_PRE_TREATMENT: True,
     M_DIFF_IN_MEANS: True,
-    M_DIFF_IN_MEANS_ON_ASSIGNMENT: True,
     M_IV: True,
     M_DID: True,
     M_DID_TIME_WINDOW: False,
@@ -123,6 +123,7 @@ class TreeResult:
     """Everything the caller needs to execute (or explain why not)."""
 
     method: Optional[str] = None
+    variant: Optional[str] = None
     implemented: bool = True
     ended: bool = False
     end_reason: Optional[str] = None
@@ -139,6 +140,7 @@ class TreeResult:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "method": self.method,
+            "variant": self.variant,
             "implemented": self.implemented,
             "ended": self.ended,
             "end_reason": self.end_reason,
@@ -198,11 +200,17 @@ class _Traversal:
         self.step("END", "end", "stop", reason)
         return self.result
 
-    def leaf(self, method: str) -> TreeResult:
+    def leaf(self, method: str, variant: Optional[str] = None) -> TreeResult:
         implemented = LEAF_IMPLEMENTED.get(method, True)
         self.result.method = method
+        self.result.variant = variant
         self.result.implemented = implemented
-        self.step(method, "leaf", "selected" if implemented else "selected (not implemented)")
+        self.step(
+            method,
+            "leaf",
+            "selected" if implemented else "selected (not implemented)",
+            detail=f"variant: {variant}" if variant else "",
+        )
         if not implemented:
             self.result.warnings.append(f"{method} is not implemented yet; this study cannot be estimated.")
         return self.result
@@ -333,7 +341,7 @@ class _Traversal:
 
         relevance = self.checked("Gate: Relevance (High F-stat)", "iv_relevance", "gate")
         if relevance is True:
-            self.leaf(M_DIFF_IN_MEANS_ON_ASSIGNMENT)
+            self.leaf(M_DIFF_IN_MEANS, variant="on_assignment")
             return
         if relevance is None:
             self.result.warnings.append(
@@ -544,8 +552,9 @@ def select_method_v2(
     ``properties`` keys (missing keys fall back to sensible defaults):
       treatment_variable, outcome_variable, treatment_variable_type,
       covariates, instrument_variable, mediator_variable, running_variable,
-      cutoff_value, time_variable, group_variable, treatment_period_start,
-      placebo_period_start, is_rct, has_temporal_structure,
+      has_running_variable, cutoff_value, time_variable, group_variable,
+      treatment_period_start, placebo_period_start, is_rct,
+      has_temporal_structure,
       is_encouragement_design, has_pre_treatment_variables,
       has_valid_instrument, has_candidate_mediator, has_valid_backdoor_set,
       is_structure_supported, anticipation_known_bounded, local_manipulation.

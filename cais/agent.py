@@ -23,6 +23,7 @@ from cais.methods.instrumental_variable.estimator import IVRegression
 from cais.methods.propensity_score.matching import PropensityScoreMatching
 from cais.models import Variables, MethodInfo
 from cais.components.assumption_checks import IVTest, ObervationalTest, DiDTest, RDDTest
+from cais.components.decision_tree_v2 import select_method_v2 as run_decision_tree_v2
 
 from .config import get_llm_client 
 #from .prompts import SYSTEM_PROMPT 
@@ -93,6 +94,7 @@ class CausalAgent():
         self.query_interpreter_output: Optional[QueryInterpreterOutput] = None # Unnecessary
         self.variables: Optional[Variables] = None
         self.selected_method: Optional[MethodInfo] = None
+        self.tree_result: Optional[Any] = None
 
         # Outputs
         self.results: Optional[Dict[str, Any]] = None
@@ -159,6 +161,132 @@ class CausalAgent():
         self.method_info = MethodInfo(**method_selector_output['method_info'])
         self.selected_method = self.method_info.selected_method
         return self.selected_method
+
+    # ------------------------------------------------------------------
+    # Decision tree v2 (revised tree with gates and advisories)
+    # ------------------------------------------------------------------
+
+    def _tree_properties(self) -> Dict[str, Any]:
+        """Translate interpreter output into decision_tree_v2 inputs.
+
+        Inputs the interpreter does not produce yet (mediator, placebo period,
+        bounded anticipation, local manipulation) are passed as unavailable so
+        the tree reports can't tell instead of guessing.
+        """
+        variables = self.variables
+        analysis = self.dataset_analysis
+
+        covariates = list(variables.covariates or [])
+        for name in (variables.confounders or []):
+            if name not in covariates:
+                covariates.append(name)
+
+        has_temporal = bool(variables.time_variable)
+        if analysis is not None:
+            has_temporal = has_temporal or bool(getattr(analysis, "temporal_structure_detected", False))
+
+        return {
+            "treatment_variable": variables.treatment_variable,
+            "outcome_variable": variables.outcome_variable,
+            "treatment_variable_type": variables.treatment_variable_type,
+            "covariates": covariates,
+            "instrument_variable": variables.instrument_variable,
+            "mediator_variable": None,          # not produced by the query interpreter yet
+            "running_variable": variables.running_variable,
+            "cutoff_value": variables.cutoff_value,
+            "time_variable": variables.time_variable,
+            "group_variable": variables.group_variable,
+            "treatment_period_start": variables.treatment_time,
+            "placebo_period_start": None,       # not produced yet
+            "is_rct": bool(variables.is_rct),
+            "has_temporal_structure": has_temporal,
+            "is_encouragement_design": None,    # inferred from the instrument by the tree
+            "has_pre_treatment_variables": bool(covariates),
+            "has_valid_instrument": bool(variables.instrument_variable),
+            "has_candidate_mediator": False,    # no mediator detection yet
+            "has_valid_backdoor_set": bool(covariates),
+            "is_structure_supported": True,
+            "anticipation_known_bounded": False,
+            "local_manipulation": False,
+        }
+
+    def select_method_v2(self, query=None, prompt_callback=None):
+        """Select a method with the revised decision tree (gates + advisories).
+
+        Unlike the legacy selector this can deliberately stop the pipeline:
+        check ``tree_result.ended`` (gate failure) and
+        ``tree_result.implemented`` (leaf not implemented yet) before executing.
+        """
+        query = self.checkq(query)
+
+        tree_result = run_decision_tree_v2(
+            self._tree_properties(),
+            df=self.load_dataset(),
+            description=self.dataset_description,
+            llm=self.llm,
+            prompt_callback=prompt_callback,
+        )
+        self.tree_result = tree_result
+        self.selected_method = tree_result.method
+
+        if tree_result.ended:
+            justification = f"Decision tree v2 stopped: {tree_result.end_reason}"
+        else:
+            justification = f"Decision tree v2 selected {tree_result.method} along: {tree_result.path}"
+            if tree_result.variant:
+                justification += f" (variant: {tree_result.variant})"
+        method_name = tree_result.method.replace("_", " ").title() if tree_result.method else None
+        self.method_info = MethodInfo(
+            selected_method=tree_result.method,
+            method_name=method_name,
+            method_justification=justification,
+            method_assumptions=list(tree_result.assumptions.keys()),
+            decision_tree=tree_result.to_dict(),
+        )
+        return tree_result
+
+    def _tree_validation_info(self) -> Optional[Dict[str, Any]]:
+        """Shape the tree result the way the explanation generator expects."""
+        if self.tree_result is None:
+            return None
+        result = self.tree_result
+        return {
+            "method": result.method,
+            "variant": result.variant,
+            "path": result.path,
+            "steps": [
+                {"node": s.node, "kind": s.kind, "outcome": s.outcome, "detail": s.detail}
+                for s in result.steps
+            ],
+            "assumptions": {name: verdict.model_dump() for name, verdict in result.assumptions.items()},
+            "concerns": list(result.warnings),
+            "planned_post_checks": list(result.planned_post_checks),
+        }
+
+    def _tree_stop_output(self) -> Dict[str, Any]:
+        """Result for a study the tree refused to hand to an estimator."""
+        result = self.tree_result
+        reason = result.end_reason or f"{result.method} is not implemented yet."
+
+        lines = [f"No causal effect was estimated. The decision tree stopped: {reason}", "", "Decision path:"]
+        for step in result.steps:
+            detail = f" ({step.detail})" if step.detail else ""
+            lines.append(f"- {step.node}: {step.outcome}{detail}")
+        if result.assumptions:
+            lines.append("")
+            lines.append("Checks:")
+            for name, verdict in result.assumptions.items():
+                label = {True: "pass", False: "fail", None: "can't tell"}[verdict.passed]
+                lines.append(f"- {name}: {label} - {verdict.reasoning}")
+
+        self.results = {
+            "status": "not_estimated",
+            "method": result.method,
+            "end_reason": reason,
+            "tree": result.to_dict(),
+        }
+        self.explanations = "\n".join(lines)
+        return {"results": self.results, "explanation": self.explanations}
 
     def discover_instruments(self, query=None):
         query = self.checkq(query)
@@ -273,7 +401,7 @@ class CausalAgent():
             variables=self.variables,
             results=self.results,
             dataset_analysis=self.dataset_analysis,
-            validation_info=None,
+            validation_info=self._tree_validation_info(),
             dataset_description=self.dataset_description,
             original_query=query
         )['explanation']
@@ -289,7 +417,8 @@ class CausalAgent():
             "explanation": self.explanations
         }
     
-    def run_analysis(self, query, llm_method_selection: Optional[bool] = True):
+    def run_analysis(self, query, llm_method_selection: Optional[bool] = True,
+                     method_selection: str = "tree_v2"):
 
         logger.info("[Causal AI Scientist Stage 1] - Dataset and Query analysis")
 
@@ -298,10 +427,18 @@ class CausalAgent():
         self.analyse_dataset(
             query=query
         )
-        self.select_method(
-            query=query,
-            llm_decision=llm_method_selection
-        )
+        if method_selection == "legacy":
+            self.select_method(
+                query=query,
+                llm_decision=llm_method_selection
+            )
+        else:
+            tree_result = self.select_method_v2(
+                query=query
+            )
+            if tree_result.ended or not tree_result.implemented:
+                logger.info("Decision tree v2 stopped: %s", tree_result.end_reason or tree_result.method)
+                return self._tree_stop_output()
         if self.selected_method == INSTRUMENTAL_VARIABLE and self.use_iv_pipeline:
             logger.info("Instrumental Variable method selected. Running IV Discovery...")
             self.discover_instruments(
