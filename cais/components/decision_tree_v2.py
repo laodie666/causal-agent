@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from cais.models import AssumptionResult
+from cais.config import load_thresholds
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,7 @@ class TreeResult:
     asks_used: int = 0  # follow-up questions asked to reach this result
     ended: bool = False
     end_reason: Optional[str] = None
+    thresholds: Dict[str, Any] = field(default_factory=dict)  # applied gate-threshold overrides
     steps: List[TreeStep] = field(default_factory=list)
     assumptions: Dict[str, AssumptionResult] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
@@ -189,6 +191,7 @@ class TreeResult:
             "asks_used": self.asks_used,
             "ended": self.ended,
             "end_reason": self.end_reason,
+            "thresholds": dict(self.thresholds),
             "warnings": list(self.warnings),
             "planned_post_checks": list(self.planned_post_checks),
             "description": self.description,
@@ -215,6 +218,7 @@ class _Traversal:
         prompt_callback: Optional[Callable[[str], Optional[str]]] = None,
         df: Any = None,
         llm: Any = None,
+        thresholds: Optional[Dict[str, Dict[str, Any]]] = None,
     ):
         self.props = dict(properties or {})
         self.df = df
@@ -222,15 +226,24 @@ class _Traversal:
         self.prompt_callback = prompt_callback
         self.description = description or self.props.get("dataset_description")
 
+        # Gate-threshold overrides: caller-provided dict wins, otherwise the
+        # user-editable thresholds.json (cais.config.load_thresholds). Only
+        # recorded on the result when the default factory actually uses them.
+        self.thresholds = dict(thresholds) if thresholds is not None else load_thresholds()
+        uses_default_factory = checks is None and checks_factory is None
+
         if checks is not None:
             self.factory = lambda _desc: checks
         elif checks_factory is not None:
             self.factory = checks_factory
         else:
-            self.factory = lambda desc: build_default_checks(self.props, self.df, desc, self.llm)
+            self.factory = lambda desc: build_default_checks(
+                self.props, self.df, desc, self.llm, thresholds=self.thresholds
+            )
 
         self.checks = self.factory(self.description)
-        self.result = TreeResult(description=self.description)
+        record_thresholds = self.thresholds if uses_default_factory else {}
+        self.result = TreeResult(description=self.description, thresholds=record_thresholds)
         self.asks_used = 0  # follow-up questions asked so far (global budget)
 
     # -- recording helpers ------------------------------------------------
@@ -299,10 +312,15 @@ class _Traversal:
         If the check reports that user-side knowledge could settle it
         (``details.missing_info``), the user is asked before the verdict is
         final; statistical failures carry no question and never ask.
+        On a decisive failure, an interactive run gets one override consult:
+        the user may pass the failed gate, otherwise the pipeline stops.
+        Batch runs have nobody to consult and stop, as before.
         """
         passed = self.checked(node, check_name, "gate")
         passed = self._maybe_reask_gate(node, check_name, "gate", passed)
         if passed is False:
+            if self._consult_override(node, check_name, fail_reason):
+                return True
             self.end(fail_reason)
             return False
         if passed is None:
@@ -373,6 +391,50 @@ class _Traversal:
             return passed
         retried = self._ask_and_rerun(node, check_name, kind)
         return passed if retried is None else retried
+
+    def _consult_override(self, node: str, check_name: str, reason: str) -> bool:
+        """Interactive override consult after a decisive gate failure.
+
+        Only traversal paths that would otherwise stop consult the user;
+        prescribed fallback routes (e.g. trimmed IPW on positivity failure)
+        keep their drawn-tree semantics and never consult. The consult is a
+        decision only: it never consumes the information-ask budget and
+        never re-runs the check. Returns True when the user passed the gate.
+        """
+        if self.prompt_callback is None:
+            self.step(node, "process", "no user available to consult", "")
+            return False
+        res = self.result.assumptions.get(check_name)
+        detail = ((res.reasoning if res is not None else "") or "")[:220]
+        question = (
+            f"{node} FAILED: {reason}\n"
+            f"Assessment: {detail}\n"
+            f"Override this gate and continue anyway? (y = proceed, n = stop)"
+        )
+        answer = self._prompt(question)
+        accepted = self._accepts_override(answer)
+        self.step(
+            node, "process", "override consult",
+            f"answered: {answer!r} -> {'pass' if accepted else 'stop'}",
+        )
+        if not accepted:
+            return False
+        self.result.warnings.append(
+            f"{node}: failed, but was passed by explicit user override; "
+            "results may be unreliable."
+        )
+        if res is not None:
+            res.details = dict(res.details or {})
+            res.details["user_override"] = True
+        self.step(node, "process", "user passed the failed gate", reason)
+        return True
+
+    @staticmethod
+    def _accepts_override(answer: Optional[str]) -> bool:
+        if not answer:
+            return False
+        norm = answer.strip().lower()
+        return norm[:1] == "y" or norm in ("1", "proceed", "override")
 
     def _prompt(self, message: str) -> Optional[str]:
         if self.prompt_callback is None:
@@ -515,6 +577,11 @@ class _Traversal:
         if anticipation is False:
             if self.props.get("anticipation_known_bounded", False):
                 self.leaf(M_DID_TIME_WINDOW)
+            elif self._consult_override(
+                "Gate: no anticipation (placebo)", "no_anticipation",
+                "Anticipation effects present and not bounded.",
+            ):
+                self.leaf(M_DID)
             else:
                 self.end("Anticipation effects present and not bounded; no-anticipation gate failed.")
             return
@@ -552,6 +619,12 @@ class _Traversal:
         if no_manipulation is False or continuity is False:
             if self.props.get("local_manipulation", False):
                 self.leaf(M_DONUT_RDD)
+            elif self._consult_override(
+                "Gates: No manipulation / Covariate continuity (McCrary test)",
+                "rdd_no_manipulation",
+                "Manipulation at the cutoff (density or covariate continuity).",
+            ):
+                self.leaf(M_RDD)
             else:
                 self.end("McCrary/density gate failed: manipulation at the cutoff.")
             return
@@ -586,6 +659,9 @@ class _Traversal:
         self._iv_advisories()
         f_stat = self.checked("Gate: High F-stat", "iv_relevance", "gate")
         if f_stat is False:
+            if self._consult_override("Gate: High F-stat", "iv_relevance", "Weak instrument (F < 10)."):
+                self.leaf(M_IV)
+                return True
             self.end("Weak instrument (F < 10).")
             return True
         if f_stat is None:
@@ -611,6 +687,12 @@ class _Traversal:
         self.advisory("Advisory: T blocks M->Y confounding", "frontdoor_t_blocks_my")
         positivity = self.checked("Gate: Positivity", "positivity", "gate")
         if positivity is False:
+            if self._consult_override(
+                "Gate: Positivity", "positivity",
+                "Positivity failed for the mediator (frontdoor) strategy.",
+            ):
+                self.leaf(M_FRONTDOOR)
+                return True
             self.end("Positivity failed for the mediator (frontdoor) strategy.")
             return True
         if positivity is None:
@@ -630,6 +712,12 @@ class _Traversal:
         positivity = self.checked("Gate: Positivity", "positivity", "gate")
         if positivity is False:
             if non_binary:
+                if self._consult_override(
+                    "Gate: Positivity", "positivity",
+                    "Positivity failed for the generalized propensity score strategy.",
+                ):
+                    self.leaf(M_GPS)
+                    return True
                 self.end("Positivity failed for the generalized propensity score strategy.")
             else:
                 self.leaf(M_TRIMMED_IPW)
@@ -673,6 +761,7 @@ def select_method_v2(
     checks: Optional[Dict[str, Callable[[], AssumptionResult]]] = None,
     checks_factory: Optional[Callable[[Optional[str]], Dict[str, Callable[[], AssumptionResult]]]] = None,
     prompt_callback: Optional[Callable[[str], Optional[str]]] = None,
+    thresholds: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> TreeResult:
     """Traverse the revised decision tree.
 
@@ -688,6 +777,10 @@ def select_method_v2(
 
     ``checks`` wins over ``checks_factory``; when neither is given, the real
     checks are bound via ``build_default_checks``.
+
+    ``thresholds`` optionally overrides gate knobs per check name (validated
+    against ``ADJUSTABLE_PARAMS``); with None, the user-editable
+    thresholds.json is consulted (see ``cais.config.load_thresholds``).
     """
     traversal = _Traversal(
         properties=properties,
@@ -697,6 +790,7 @@ def select_method_v2(
         prompt_callback=prompt_callback,
         df=df,
         llm=llm,
+        thresholds=thresholds,
     )
     return traversal.run()
 
@@ -716,12 +810,55 @@ def _fit_propensity_scores(vars) -> Any:
     return model.predict_proba(x)[:, 1]
 
 
-def build_default_checks(properties: Dict[str, Any], df, description, llm):
+# Grant knobs per check: exactly these parameter names may be overridden
+# from the user-editable thresholds file (or a caller-supplied dict).
+ADJUSTABLE_PARAMS: Dict[str, set] = {
+    "parallel_trends": {"alpha"},
+    "no_anticipation": {"alpha"},
+    "iv_relevance": {"f_threshold"},
+    "positivity": {"overlap_threshold", "extreme_ps_bounds", "max_extreme_pct"},
+    "rdd_no_manipulation": {"alpha"},
+    "rdd_covariate_continuity": {"alpha"},
+    "frontdoor_positivity": {"min_count"},
+    "baseline_outcome_balance": {"smd_threshold"},
+    "cond_ignorability": {"smd_threshold"},
+}
+
+
+def _clean(overrides):
+    """Normalize JSON-loaded threshold overrides (lists -> tuples for bounds)."""
+    out = {}
+    for key, value in dict(overrides or {}).items():
+        out[key] = tuple(value) if (isinstance(value, list) and key.endswith("_bounds")) else value
+    return out
+
+
+def build_default_checks(properties: Dict[str, Any], df, description, llm, thresholds=None):
     """Bind the real pre-model assumption checks for the traversal.
 
     Imports are local so the tree module stays importable without the full
     stats stack when tests inject stubs.
+
+    ``thresholds`` maps check names to keyword overrides, validated strictly
+    against ``ADJUSTABLE_PARAMS`` (unknown check names or unknown parameter
+    keys raise ``ValueError``). When None, the user-editable thresholds.json
+    is consulted via ``cais.config.load_thresholds``.
     """
+    thresholds = load_thresholds() if thresholds is None else dict(thresholds or {})
+    unknown_names = set(thresholds) - set(ADJUSTABLE_PARAMS)
+    if unknown_names:
+        raise ValueError(
+            f"Unknown threshold checks: {sorted(unknown_names)}. "
+            f"Adjustable checks: {sorted(ADJUSTABLE_PARAMS)}"
+        )
+    for name, kwargs in thresholds.items():
+        bad = set(kwargs) - ADJUSTABLE_PARAMS[name]
+        if bad:
+            raise ValueError(
+                f"Invalid threshold parameter(s) {sorted(bad)} for '{name}'. "
+                f"Adjustable: {sorted(ADJUSTABLE_PARAMS[name])}"
+            )
+
     from cais.models import AssumptionVariables
     from cais.methods import pre_model_assumption_utils as pm
 
@@ -763,25 +900,46 @@ def build_default_checks(properties: Dict[str, Any], df, description, llm):
     def placeholder(reason: str):
         return lambda: AssumptionResult(passed=None, reasoning=reason)
 
-    return {
+    checks: Dict[str, Callable[[], AssumptionResult]] = {
         "sutva": lambda: pm.check_sutva(vars, llm=llm),
         "stable_group_composition": lambda: pm.check_stable_group_composition(vars, llm=llm),
-        "baseline_outcome_balance": lambda: pm.check_baseline_outcome_balance(vars),
-        "parallel_trends": lambda: pm.check_parallel_trends(vars),
-        "no_anticipation": lambda: pm.check_no_anticipation(vars),
-        "iv_relevance": lambda: pm.check_iv_relevance(vars),
+        "baseline_outcome_balance": lambda: pm.check_baseline_outcome_balance(
+            vars, **_clean(thresholds.get("baseline_outcome_balance"))
+        ),
+        "parallel_trends": lambda: pm.check_parallel_trends(
+            vars, **_clean(thresholds.get("parallel_trends"))
+        ),
+        "no_anticipation": lambda: pm.check_no_anticipation(
+            vars, **_clean(thresholds.get("no_anticipation"))
+        ),
+        "iv_relevance": lambda: pm.check_iv_relevance(
+            vars, **_clean(thresholds.get("iv_relevance"))
+        ),
         "iv_exclusion": lambda: pm.check_iv_exclusion(vars, llm=llm),
         "iv_exogeneity": lambda: pm.check_iv_exogeneity(vars, llm=llm),
         "iv_monotonicity": lambda: pm.check_iv_monotonicity(vars, llm=llm),
-        "cond_ignorability": lambda: pm.check_cond_ignorability(vars),
-        "positivity": lambda: pm.check_positivity(vars, propensity_scores=propensity_scores()),
-        "rdd_no_manipulation": lambda: pm.check_rdd_no_manipulation(vars),
-        "rdd_covariate_continuity": lambda: pm.check_rdd_covariate_continuity(vars),
+        "cond_ignorability": lambda: pm.check_cond_ignorability(
+            vars, **_clean(thresholds.get("cond_ignorability"))
+        ),
+        "rdd_no_manipulation": lambda: pm.check_rdd_no_manipulation(
+            vars, **_clean(thresholds.get("rdd_no_manipulation"))
+        ),
+        "rdd_covariate_continuity": lambda: pm.check_rdd_covariate_continuity(
+            vars, **_clean(thresholds.get("rdd_covariate_continuity"))
+        ),
         "rdd_continuity_potential_outcomes": lambda: pm.check_rdd_continuity_potential_outcomes(vars, llm=llm),
         "frontdoor_full_mediation": lambda: pm.check_frontdoor_full_mediation(vars, llm=llm),
         "frontdoor_no_tm_confounding": lambda: pm.check_frontdoor_no_TM_confounding(vars, llm=llm),
         "frontdoor_t_blocks_my": lambda: pm.check_frontdoor_T_blocks_MY(vars, llm=llm),
-        "frontdoor_positivity": lambda: pm.check_frontdoor_positivity(vars),
+        "frontdoor_positivity": lambda: pm.check_frontdoor_positivity(
+            vars, **_clean(thresholds.get("frontdoor_positivity"))
+        ),
         "gps_cond_ignorability": placeholder("GPS pre-model cond. ignorability check is not implemented yet."),
         "gps_positivity": placeholder("GPS pre-model positivity check is not implemented yet."),
     }
+    # positivity is wired separately so the propensity scores are only fitted
+    # when that check is actually requested.
+    checks["positivity"] = lambda: pm.check_positivity(
+        vars, propensity_scores=propensity_scores(), **_clean(thresholds.get("positivity"))
+    )
+    return checks

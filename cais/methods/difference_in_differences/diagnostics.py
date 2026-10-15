@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 def validate_parallel_trends(df: pd.DataFrame, time_var: str, outcome: str,
                              group_indicator_col: str, treatment_period_start: Any,
                              dataset_description: Optional[str] = None,
-                             time_varying_covariates: Optional[List[str]] = None) -> Dict[str, Any]:
+                             time_varying_covariates: Optional[List[str]] = None,
+                             alpha: float = 0.05) -> Dict[str, Any]:
     """Validates the parallel trends assumption using pre-treatment data.
 
     Regresses the outcome on group-specific time trends before the treatment period.
@@ -77,9 +78,9 @@ def validate_parallel_trends(df: pd.DataFrame, time_var: str, outcome: str,
             group_trend_pvalue = simple_results.pvalues['group_trend']
 
             # If p > 0.05, trends are not significantly different
-            validation_result["valid"] = group_trend_pvalue > 0.05
+            validation_result["valid"] = group_trend_pvalue > alpha
             validation_result["p_value"] = group_trend_pvalue
-            validation_result["details"] = f"Simple linear trend test: p-value for group-trend interaction: {group_trend_pvalue:.4f}. Parallel trends: {validation_result['valid']}."
+            validation_result["details"] = f"Simple linear trend test: p-value for group-trend interaction: {group_trend_pvalue:.4f} (alpha={alpha:g}). Parallel trends: {validation_result['valid']}."
             logger.info(validation_result["details"])
 
             # If we've successfully validated with the simple approach, return
@@ -148,9 +149,9 @@ def validate_parallel_trends(df: pd.DataFrame, time_var: str, outcome: str,
                     f_value = ((model_without.ssr - model_with.ssr) / df_model) / (model_with.ssr / df_residual)
                     p_value = 1 - stats.f.cdf(f_value, df_model, df_residual)
 
-                    validation_result["valid"] = p_value > 0.05
+                    validation_result["valid"] = p_value > alpha
                     validation_result["p_value"] = p_value
-                    validation_result["details"] = f"Manual F-test for pre-treatment interactions: F({df_model}, {df_residual})={f_value:.4f}, p={p_value:.4f}. Parallel trends: {validation_result['valid']}."
+                    validation_result["details"] = f"Manual F-test for pre-treatment interactions: F({df_model}, {df_residual})={f_value:.4f}, p={p_value:.4f} (alpha={alpha:g}). Parallel trends: {validation_result['valid']}."
                     logger.info(validation_result["details"])
 
                 except Exception as e:
@@ -159,7 +160,7 @@ def validate_parallel_trends(df: pd.DataFrame, time_var: str, outcome: str,
                     # If F-test fails, check individual coefficients
                     significant_interactions = 0
                     for term in interaction_terms:
-                        if term in complex_results.pvalues and complex_results.pvalues[term] < 0.05:
+                        if term in complex_results.pvalues and complex_results.pvalues[term] < alpha:
                             significant_interactions += 1
 
                     validation_result["valid"] = significant_interactions == 0
@@ -168,7 +169,7 @@ def validate_parallel_trends(df: pd.DataFrame, time_var: str, outcome: str,
                         validation_result["p_value"] = 1.0 - (significant_interactions / len(interaction_terms))
                     else:
                         validation_result["p_value"] = 1.0  # Default to 1.0 if no interaction terms
-                    validation_result["details"] = f"{significant_interactions} out of {len(interaction_terms)} pre-treatment interactions are significant at p<0.05. Parallel trends: {validation_result['valid']}."
+                    validation_result["details"] = f"{significant_interactions} out of {len(interaction_terms)} pre-treatment interactions are significant at p<{alpha:g}. Parallel trends: {validation_result['valid']}."
                     logger.info(validation_result["details"])
             else:
                 validation_result["valid"] = None

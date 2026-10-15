@@ -290,7 +290,7 @@ def check_parallel_trends(
     )
 
 
-def check_no_anticipation(vars: AssumptionVariables) -> AssumptionResult:
+def check_no_anticipation(vars: AssumptionVariables, alpha: float = 0.10) -> AssumptionResult:
     """No anticipation: treatment has no effect before implementation.
 
     Runs a placebo DiD restricted to pre-treatment periods, avoiding contamination
@@ -346,14 +346,14 @@ def check_no_anticipation(vars: AssumptionVariables) -> AssumptionResult:
 
         effect = float(res.params["__did_pl__"])
         p_val = float(res.pvalues["__did_pl__"])
-        passed = p_val > 0.10
+        passed = p_val > alpha
         return AssumptionResult(
             passed=passed,
             reasoning=(
                 f"Placebo treatment effect (pre-treatment only): {effect:.4f} "
                 f"(p={p_val:.4f}). Test {'passed' if passed else 'failed'}."
             ),
-            details={"effect_estimate": effect, "p_value": p_val},
+            details={"effect_estimate": effect, "p_value": p_val, "alpha": alpha},
         )
     except Exception as exc:
         return AssumptionResult(
@@ -462,12 +462,14 @@ def check_rdd_no_manipulation(
     vars: AssumptionVariables,
     n_bins: int = 50,
     bandwidth: float = None,
+    alpha: float = 0.05,
+    bandwidth_fraction: float = 0.25,
 ) -> AssumptionResult:
     """McCrary-style density test: check for bunching at the cutoff."""
     rv = vars.df[vars.running_variable].dropna()
 
     if bandwidth is None:
-        bandwidth = (rv.max() - rv.min()) * 0.25
+        bandwidth = (rv.max() - rv.min()) * bandwidth_fraction
 
     near = rv[(rv >= vars.cutoff - bandwidth) & (rv <= vars.cutoff + bandwidth)]
     below = near[near < vars.cutoff]
@@ -485,7 +487,7 @@ def check_rdd_no_manipulation(
     except AttributeError:
         p_value = scipy_stats.binom_test(len(below), total, 0.5)
 
-    passed = p_value > 0.05
+    passed = p_value > alpha
     status_msg = "No evidence of manipulation." if passed else "Significant density discontinuity — possible manipulation."
     return AssumptionResult(
         passed=passed,
@@ -506,6 +508,8 @@ def check_rdd_no_manipulation(
 def check_rdd_covariate_continuity(
     vars: AssumptionVariables,
     bandwidth: float = None,
+    alpha: float = 0.05,
+    bandwidth_fraction: float = 0.1,
 ) -> AssumptionResult:
     """Check continuity of covariates at the cutoff via t-tests."""
     if not vars.covariates:
@@ -513,7 +517,7 @@ def check_rdd_covariate_continuity(
 
     if bandwidth is None:
         rv_range = vars.df[vars.running_variable].max() - vars.df[vars.running_variable].min()
-        bandwidth = 0.1 * rv_range
+        bandwidth = bandwidth_fraction * rv_range
 
     df_bw = vars.df[
         (vars.df[vars.running_variable] >= vars.cutoff - bandwidth) &
@@ -532,7 +536,7 @@ def check_rdd_covariate_continuity(
             continue
         t_stat, p_val = scipy_stats.ttest_ind(below[cov].dropna(), above[cov].dropna(), equal_var=False)
         results[cov] = {"t_stat": float(t_stat), "p_value": float(p_val)}
-        if p_val < 0.05:
+        if p_val < alpha:
             discontinuous.append(cov)
 
     passed = len(discontinuous) == 0
@@ -542,7 +546,7 @@ def check_rdd_covariate_continuity(
             f"Covariate continuity at cutoff ({vars.cutoff}) on {len(results)} covariates. "
             f"{'All continuous.' if passed else f'Discontinuous: {discontinuous}.'}"
         ),
-        details={"covariate_tests": results, "discontinuous": discontinuous, "bandwidth": bandwidth},
+        details={"covariate_tests": results, "discontinuous": discontinuous, "bandwidth": bandwidth, "alpha": alpha},
     )
 
 

@@ -269,8 +269,10 @@ class TestGateReaskLoop(unittest.TestCase):
             return stub_checks(sutva=True, parallel_trends=True, no_anticipation=None,
                                stable_group_composition=lambda: comp)
 
-        def prompt(_msg):
+        def prompt(msg):
             prompts["n"] += 1
+            if "Override this gate" in msg:
+                return "n"
             return "no major attrition occurs"
 
         res = run(
@@ -283,8 +285,97 @@ class TestGateReaskLoop(unittest.TestCase):
         self.assertTrue(res.ended)
         self.assertIsNone(res.method)
         self.assertIn("Group composition", res.end_reason)
+        # 1 ask for the check's own question + 1 consult offer the user declined
         self.assertEqual(res.asks_used, 1)
-        self.assertEqual(prompts["n"], 1)
+        self.assertEqual(prompts["n"], 2)
+        self.assertFalse(res.assumptions["stable_group_composition"].details.get("user_override"))
+
+    def test_interactive_fail_overridden_to_pass(self):
+        prompts = []
+
+        def prompt(msg):
+            prompts.append(msg)
+            return "y" if "Override this gate" in msg else "answer"
+
+        checks = stub_checks(
+            sutva=True, parallel_trends=True, no_anticipation=True,
+            stable_group_composition=lambda: AssumptionResult(
+                passed=False, reasoning="attrition suspected"
+            ),
+        )
+        res = run(
+            self._did_props(), checks=checks, prompt_callback=prompt,
+            description="Panel data.",
+        )
+
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_DID)
+        self.assertEqual(len(prompts), 1)  # only the consult; no question ever asked
+        self.assertTrue(any("user override" in w for w in res.warnings))
+        comp = res.assumptions["stable_group_composition"]
+        self.assertFalse(comp.passed)  # the fail stays a fail, honestly recorded
+        self.assertTrue(comp.details.get("user_override"))
+        self.assertEqual(res.asks_used, 0)  # consult does not consume the ask budget
+
+    def test_interactive_fail_declined_ends(self):
+        checks = stub_checks(
+            sutva=True, parallel_trends=True, no_anticipation=True,
+            stable_group_composition=False,
+        )
+        res = run(
+            self._did_props(), checks=checks,
+            prompt_callback=lambda m: "y" if "Override this gate" in m and False else "n",
+            description="Panel data.",
+        )
+
+        self.assertTrue(res.ended)
+        self.assertIn("Group composition", res.end_reason)
+        self.assertFalse(any("user override" in w for w in res.warnings))
+
+    def test_batch_fail_consults_nobody_and_ends(self):
+        checks = stub_checks(
+            sutva=True, parallel_trends=True, no_anticipation=True,
+            stable_group_composition=False,
+        )
+        res = run(self._did_props(), checks=checks)  # no prompt_callback
+
+        self.assertTrue(res.ended)
+        self.assertTrue(any(s.outcome == "no user available to consult" for s in res.steps))
+        self.assertFalse(any("override" in w.lower() for w in res.warnings))
+
+    def test_weak_instrument_can_be_overridden(self):
+        checks = stub_checks(iv_relevance=False)
+        res = run(
+            base_props(instrument_variable="z"), checks=checks,
+            prompt_callback=lambda m: "y" if "Override this gate" in m else None,
+        )
+
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_IV)
+
+    def test_no_anticipation_fail_can_be_overridden(self):
+        checks = stub_checks(
+            sutva=True, parallel_trends=True, stable_group_composition=True,
+            no_anticipation=False,
+        )
+        res = run(
+            self._did_props(), checks=checks,
+            prompt_callback=lambda m: "y" if "Override this gate" in m else None,
+        )
+
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_DID)
+
+    def test_nonbinary_positivity_fail_can_be_overridden(self):
+        checks = stub_checks(positivity=False)
+        res = run(
+            base_props(treatment_variable_type="continuous", covariates=["x1"]),
+            checks=checks,
+            prompt_callback=lambda m: "y" if "Override this gate" in m else None,
+        )
+
+        self.assertFalse(res.ended)
+        self.assertEqual(res.method, M_GPS)
 
     def test_gate_can_tell_without_question_never_asks(self):
         prompts = {"n": 0}
