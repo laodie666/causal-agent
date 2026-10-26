@@ -660,7 +660,31 @@ class TestOptions(unittest.TestCase):
     def test_backdoor_positivity_fail_goes_trimmed_ipw(self):
         res = run(base_props(), checks=stub_checks(positivity=False))
         self.assertEqual(res.method, M_TRIMMED_IPW)
-        self.assertFalse(res.implemented)
+        self.assertTrue(res.implemented)
+        self.assertEqual(res.execution["method"], M_TRIMMED_IPW)
+        self.assertEqual(res.execution["options"]["ps_bounds"], [0.1, 0.9])
+        self.assertEqual(res.execution["display_name"], "Trimmed Inverse Probability Weighting")
+        self.assertIn("balance_after_weighting", res.planned_post_checks)
+        self.assertTrue(any("trimmed ipw" in w.lower() for w in res.warnings))
+        self.assertTrue(any(s.node == "Trimmed IPW" and s.outcome == "ps_bounds applied"
+                            for s in res.steps))
+
+    def test_trimmed_ipw_uses_configured_positivity_bounds(self):
+        res = run(
+            base_props(),
+            checks=stub_checks(positivity=False),
+            thresholds={"positivity": {"extreme_ps_bounds": [0.05, 0.95]}},
+        )
+        self.assertEqual(res.execution["options"]["ps_bounds"], [0.05, 0.95])
+        self.assertIn("[0.05, 0.95]", " ".join(res.warnings))
+
+    def test_trimmed_ipw_falls_back_to_default_bounds(self):
+        res = run(
+            base_props(),
+            checks=stub_checks(positivity=False),
+            thresholds={"positivity": {"extreme_ps_bounds": [0.9, 0.1]}},
+        )
+        self.assertEqual(res.execution["options"]["ps_bounds"], [0.1, 0.9])
 
     def test_backdoor_untestable_balance_defaults_to_matching(self):
         res = run(base_props(), checks=stub_checks(cond_ignorability=None))
@@ -763,7 +787,7 @@ class TestResultShape(unittest.TestCase):
         res = run(base_props(**DID_PROPS))
         d = res.to_dict()
         for key in ("method", "implemented", "ended", "end_reason", "warnings",
-                    "planned_post_checks", "path", "steps", "assumptions"):
+                    "planned_post_checks", "path", "steps", "assumptions", "execution"):
             self.assertIn(key, d)
         self.assertIsInstance(d["path"], str)
         for entry in d["assumptions"].values():

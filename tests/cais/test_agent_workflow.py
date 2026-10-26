@@ -5,6 +5,7 @@ from unittest.mock import patch, MagicMock
 
 import cais.agent as cais_agent
 from cais.agent import CausalAgent
+from cais.methods.propensity_score.weighting import TrimmedIPW
 from cais.models import AssumptionResult, Variables
 from cais.components.decision_tree_v2 import TreeResult, TreeStep
 
@@ -218,15 +219,15 @@ class TestDecisionTreeV2Wiring(unittest.TestCase):
     def test_tree_stop_output_for_unimplemented_leaf(self):
         agent = self._make_agent()
         agent.tree_result = TreeResult(
-            method="trimmed_ipw",
+            method="frontdoor_adjustment",
             implemented=False,
-            warnings=["trimmed_ipw is not implemented yet; this study cannot be estimated."],
-            steps=[TreeStep("Leaf: trimmed IPW", "leaf", "selected (not implemented)")],
+            warnings=["frontdoor_adjustment is not implemented yet; this study cannot be estimated."],
+            steps=[TreeStep("frontdoor_adjustment", "leaf", "selected (not implemented)")],
         )
 
         output = agent._tree_stop_output()
 
-        self.assertIn("trimmed_ipw is not implemented yet", output["explanation"])
+        self.assertIn("frontdoor_adjustment is not implemented yet", output["explanation"])
 
     @patch('cais.agent.run_decision_tree_v2')
     def test_run_analysis_stops_before_controls_and_execution(self, mock_tree):
@@ -275,6 +276,61 @@ class TestDecisionTreeV2Wiring(unittest.TestCase):
         agent.clean_dataset.assert_called_once()
         agent.execute_method.assert_called_once()
         self.assertEqual(output["explanation"], "done")
+
+    @patch('cais.agent.run_decision_tree_v2')
+    def test_select_method_v2_uses_execution_display_name(self, mock_tree):
+        agent = self._make_agent()
+        mock_tree.return_value = TreeResult(
+            method="trimmed_ipw",
+            implemented=True,
+            execution={
+                "method": "trimmed_ipw",
+                "display_name": "Trimmed Inverse Probability Weighting",
+                "options": {"ps_bounds": [0.1, 0.9]},
+            },
+        )
+
+        agent.select_method_v2()
+
+        self.assertEqual(agent.method_info.method_name, "Trimmed Inverse Probability Weighting")
+        self.assertEqual(agent.method_info.selected_method, "trimmed_ipw")
+        self.assertEqual(
+            agent.method_info.decision_tree["execution"]["options"]["ps_bounds"], [0.1, 0.9]
+        )
+
+    def test_execute_method_passes_tree_execution_options(self):
+        agent = self._make_agent()
+        captured = {}
+
+        class FakeEstimator:
+            def __call__(self, df=None, variables=None, query=None, **options):
+                captured["df"] = df
+                captured.update(options)
+                return {"effect_estimate": 1.23}
+
+        agent.estimators.estimators[TrimmedIPW.name] = FakeEstimator()
+        agent.selected_method = "trimmed_ipw"
+        agent.method_info = MagicMock()
+        agent.tree_result = TreeResult(
+            method="trimmed_ipw",
+            implemented=True,
+            execution={"method": "trimmed_ipw", "options": {"ps_bounds": [0.1, 0.9]}},
+        )
+
+        with patch('cais.agent.explanation_generator_tool') as mock_explain:
+            mock_explain.func.return_value = {"explanation": "ok"}
+            agent.execute_method()
+
+        self.assertIsInstance(captured["df"], pd.DataFrame)
+        self.assertEqual(captured["ps_bounds"], [0.1, 0.9])
+        self.assertEqual(agent.results["effect_estimate"], 1.23)
+
+    def test_trimmed_ipw_is_registered_for_execution(self):
+        from cais.agent import convert
+        from cais.estimator_lib import Estimators
+
+        self.assertEqual(convert["trimmed_ipw"], TrimmedIPW.name)
+        self.assertIn(TrimmedIPW.name, Estimators().estimators)
 
 
 if __name__ == '__main__':

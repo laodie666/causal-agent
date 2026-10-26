@@ -65,7 +65,7 @@ LEAF_IMPLEMENTED: Dict[str, bool] = {
     M_FUZZY_RDD: False,
     M_IPW: True,
     M_PSM: True,
-    M_TRIMMED_IPW: False,
+    M_TRIMMED_IPW: True,  # positivity-failure remedy: IPW trimmed to the overlap band
     M_FRONTDOOR: False,  # left unimplemented for now (team decision)
     M_GPS: True,
 }
@@ -178,6 +178,9 @@ class TreeResult:
     warnings: List[str] = field(default_factory=list)
     planned_post_checks: List[str] = field(default_factory=list)
     description: Optional[str] = None
+    # Leaf-specific settings the agent needs in order to execute the method
+    # (e.g. {"method": "trimmed_ipw", "display_name": ..., "options": {...}}).
+    execution: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def path(self) -> str:
@@ -195,6 +198,7 @@ class TreeResult:
             "warnings": list(self.warnings),
             "planned_post_checks": list(self.planned_post_checks),
             "description": self.description,
+            "execution": dict(self.execution),
             "path": self.path,
             "steps": [
                 {"node": s.node, "kind": s.kind, "outcome": s.outcome, "detail": s.detail}
@@ -720,7 +724,7 @@ class _Traversal:
                     return True
                 self.end("Positivity failed for the generalized propensity score strategy.")
             else:
-                self.leaf(M_TRIMMED_IPW)
+                self._select_trimmed_ipw()
             return True
         if positivity is None:
             self.result.warnings.append("Positivity could not be tested; continuing with warning.")
@@ -746,6 +750,52 @@ class _Traversal:
             self.leaf(M_PSM)
             self.result.planned_post_checks.append("balance_after_matching")
         return True
+
+    def _positivity_bounds(self) -> tuple:
+        """Propensity-score overlap band used by the trimmed-IPW leaf.
+
+        Mirrors the bounds the positivity gate is configured with
+        (``positivity.extreme_ps_bounds``), falling back to (0.1, 0.9).
+        """
+        raw = ((self.thresholds or {}).get("positivity") or {}).get("extreme_ps_bounds")
+        if isinstance(raw, (list, tuple)) and len(raw) == 2:
+            try:
+                lo, hi = float(raw[0]), float(raw[1])
+                if 0.0 <= lo < hi <= 1.0:
+                    return lo, hi
+            except (TypeError, ValueError):
+                pass
+            self.result.warnings.append(
+                f"Ignoring invalid positivity.extreme_ps_bounds {list(raw)!r}; using [0.1, 0.9]."
+            )
+        return 0.1, 0.9
+
+    def _select_trimmed_ipw(self) -> None:
+        """Choose trimmed IPW as the positivity-failure remedy.
+
+        Records the execution settings (bounds from the positivity config) and
+        the estimand caveat so the agent can run the trimmed estimator and the
+        explainer can state what the estimate refers to.
+        """
+        lo, hi = self._positivity_bounds()
+        self.leaf(M_TRIMMED_IPW)
+        self.result.execution = {
+            "method": M_TRIMMED_IPW,
+            "display_name": "Trimmed Inverse Probability Weighting",
+            "options": {"ps_bounds": [lo, hi]},
+        }
+        self.result.warnings.append(
+            f"Positivity gate failed; using trimmed IPW with propensity-score bounds "
+            f"[{lo:g}, {hi:g}]. Units outside the overlap band are dropped, so the "
+            "estimate targets the overlap-satisfying subpopulation."
+        )
+        self.result.planned_post_checks.append("balance_after_weighting")
+        self.step(
+            "Trimmed IPW",
+            "process",
+            "ps_bounds applied",
+            f"drop units with propensity score outside [{lo:g}, {hi:g}]",
+        )
 
 
 # ---------------------------------------------------------------------------

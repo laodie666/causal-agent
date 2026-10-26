@@ -21,6 +21,7 @@ from cais.methods.regression_discontinuity.estimator import RDDRegression
 from cais.methods.difference_in_differences.estimator import DiDRegression
 from cais.methods.instrumental_variable.estimator import IVRegression
 from cais.methods.propensity_score.matching import PropensityScoreMatching
+from cais.methods.propensity_score.weighting import TrimmedIPW
 from cais.models import Variables, MethodInfo
 from cais.components.assumption_checks import IVTest, ObervationalTest, DiDTest, RDDTest
 from cais.components.decision_tree_v2 import select_method_v2 as run_decision_tree_v2
@@ -39,6 +40,7 @@ DIFF_IN_DIFF = "difference_in_differences"
 REGRESSION_DISCONTINUITY = "regression_discontinuity_design"
 PROPENSITY_SCORE_MATCHING = "propensity_score_matching"
 INSTRUMENTAL_VARIABLE = "instrumental_variable"
+TRIMMED_IPW = "trimmed_ipw"
 
 # Temporary name conversion
 convert = {
@@ -46,7 +48,8 @@ convert = {
     DIFF_IN_DIFF: DiDRegression.name,
     REGRESSION_DISCONTINUITY: RDDRegression.name,
     INSTRUMENTAL_VARIABLE: IVRegression.name,
-    PROPENSITY_SCORE_MATCHING: PropensityScoreMatching.name
+    PROPENSITY_SCORE_MATCHING: PropensityScoreMatching.name,
+    TRIMMED_IPW: TrimmedIPW.name,
 }
 
 os.makedirs('./logs/', exist_ok=True)
@@ -236,7 +239,11 @@ class CausalAgent():
             justification = f"Decision tree v2 selected {tree_result.method} along: {tree_result.path}"
             if tree_result.variant:
                 justification += f" (variant: {tree_result.variant})"
-        method_name = tree_result.method.replace("_", " ").title() if tree_result.method else None
+        execution = dict(getattr(tree_result, "execution", {}) or {})
+        display_name = execution.get("display_name")
+        method_name = display_name or (
+            tree_result.method.replace("_", " ").title() if tree_result.method else None
+        )
         self.method_info = MethodInfo(
             selected_method=tree_result.method,
             method_name=method_name,
@@ -364,9 +371,17 @@ class CausalAgent():
         
         query = self.checkq(query)
         logger.info(f"Starting method execution. Trying to run {self.selected_method}")
+
+        # The tree may hand down leaf-specific execution settings (e.g. the
+        # propensity-score bounds for trimmed IPW). The leaf id stays in the
+        # trace, while ``execution.method`` names the estimator to run.
+        execution = dict(getattr(self.tree_result, "execution", {}) or {})
+        execution_method = execution.get("method") or self.selected_method
+        method_options = dict(execution.get("options") or {})
+        logger.info(f"Executing '{execution_method}' with options {method_options}")
         try:
             estimator = self.estimators[
-                convert[self.selected_method]
+                convert[execution_method]
             ]
 
             df = self.load_dataset(cleaned=True)
@@ -380,11 +395,12 @@ class CausalAgent():
             self.results = estimator(
                 df=df,
                 variables=self.variables,
-                query=query
+                query=query,
+                **method_options
             ) | self.llm_info # append llm info
         except:
             method_executor_input = MethodExecutorInput(
-                        method = self.selected_method,
+                        method = execution_method,
                         variables=self.variables,
                         dataset_path=self.cleaned_dataset_path,
                         dataset_analysis=self.dataset_analysis,

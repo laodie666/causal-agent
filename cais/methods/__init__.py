@@ -8,6 +8,7 @@ that can be selected and applied by the cais pipeline.
 from .causal_method import CausalMethod
 from .propensity_score.matching import estimate_effect as psm_estimate_effect
 from .propensity_score.weighting import estimate_effect as psw_estimate_effect
+from .propensity_score.weighting import estimate_effect_trimmed_ipw
 from .instrumental_variable.estimator import estimate_effect as iv_estimate_effect
 from .difference_in_differences.estimator import estimate_effect as did_estimate_effect
 from .diff_in_means.estimator import estimate_effect as dim_estimate_effect
@@ -20,6 +21,7 @@ from .generalized_propensity_score.estimator import estimate_effect_gps
 METHOD_MAPPING = {
     "propensity_score_matching": psm_estimate_effect,
     "propensity_score_weighting": psw_estimate_effect,
+    "trimmed_ipw": estimate_effect_trimmed_ipw,
     "instrumental_variable": iv_estimate_effect,
     "difference_in_differences": did_estimate_effect,
     "regression_discontinuity_design": rdd_estimate_effect,
@@ -33,6 +35,7 @@ __all__ = [
     "CausalMethod",
     "psm_estimate_effect",
     "psw_estimate_effect",
+    "estimate_effect_trimmed_ipw",
     "iv_estimate_effect",
     "did_estimate_effect",
     "rdd_estimate_effect",
