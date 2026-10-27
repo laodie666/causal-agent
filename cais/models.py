@@ -242,6 +242,9 @@ class MethodExecutorInput(BaseModel):
     # Include validation_info from validator output if needed by estimator or LLM assist later?
     validation_info: Optional[Any] = None 
     original_query: Optional[str] = None
+    # Leaf-specific execution settings resolved by the decision tree (e.g. the
+    # propensity-score bounds for trimmed IPW, the mediator for frontdoor).
+    method_options: Optional[Dict[str, Any]] = None
 # --- Model for Explanation Generator Tool --- 
 
 class ExplainerInput(BaseModel):

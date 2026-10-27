@@ -66,7 +66,7 @@ LEAF_IMPLEMENTED: Dict[str, bool] = {
     M_IPW: True,
     M_PSM: True,
     M_TRIMMED_IPW: True,  # positivity-failure remedy: IPW trimmed to the overlap band
-    M_FRONTDOOR: False,  # left unimplemented for now (team decision)
+    M_FRONTDOOR: True,  # mediator-based identification for discrete treatment/mediator
     M_GPS: True,
 }
 
@@ -101,6 +101,7 @@ DESCRIPTION_PROMPT = (
 
 MAX_PROMPTS = 3  # per-node cap on follow-up questions
 MAX_TOTAL_ASKS = 3  # global cap per run, shared by every asking node (SUTVA included)
+MAX_FRONTDOOR_LEVELS = 10  # discrete treatment/mediator cardinality the frontdoor sum supports
 
 _PERIOD_TOKEN_RE = re.compile(
     r"(?P<kind>placebo|treatment)\s*(?:period[_ ]?start)?\s*[:=]\s*(?P<num>-?\d+(?:\.\d+)?)",
@@ -686,23 +687,92 @@ class _Traversal:
         if not has:
             return False
 
+        # A mediator column is not enough: the frontdoor plug-in needs a finite
+        # treatment/mediator level set with populated cells. Unusable candidates
+        # are treated as "no usable mediator" so the traversal continues to the
+        # backdoor branch instead of stopping on a data-suitability problem.
+        unsupported = self._frontdoor_data_unsupported_reason()
+        if unsupported:
+            self.step("Frontdoor data suitability", "process", "unsupported", unsupported)
+            self.result.warnings.append(
+                f"Candidate mediator cannot support frontdoor adjustment ({unsupported}); "
+                "continuing to the backdoor branch."
+            )
+            return False
+
         self.advisory("Advisory: Full mediation", "frontdoor_full_mediation")
         self.advisory("Advisory: No TM confounding", "frontdoor_no_tm_confounding")
         self.advisory("Advisory: T blocks M->Y confounding", "frontdoor_t_blocks_my")
-        positivity = self.checked("Gate: Positivity", "positivity", "gate")
+        positivity = self.checked("Gate: Positivity", "frontdoor_positivity", "gate")
         if positivity is False:
             if self._consult_override(
-                "Gate: Positivity", "positivity",
+                "Gate: Positivity", "frontdoor_positivity",
                 "Positivity failed for the mediator (frontdoor) strategy.",
             ):
-                self.leaf(M_FRONTDOOR)
+                self._select_frontdoor()
                 return True
             self.end("Positivity failed for the mediator (frontdoor) strategy.")
             return True
         if positivity is None:
             self.result.warnings.append("Positivity could not be tested; continuing with warning.")
-        self.leaf(M_FRONTDOOR)
+        self._select_frontdoor()
         return True
+
+    def _frontdoor_data_unsupported_reason(self) -> Optional[str]:
+        """Why frontdoor cannot run on this data, or None when it looks usable.
+
+        Uses the dataframe when the caller supplied one; without it (unit tests,
+        stub checks) suitability is left to the estimator's own guards.
+        """
+        if self.df is None or not hasattr(self.df, "columns"):
+            return None
+        treatment = self.props.get("treatment_variable")
+        mediator = self.props.get("mediator_variable")
+        if not treatment or not mediator:
+            return "mediator or treatment column is unknown"
+        if treatment not in self.df.columns or mediator not in self.df.columns:
+            return f"column(s) missing from the dataset ({treatment!r}, {mediator!r})"
+        if self.props.get("treatment_variable_type") == "continuous":
+            return "the treatment is continuous (frontdoor needs discrete treatment levels)"
+        data = self.df[[treatment, mediator]].dropna()
+        if data.empty:
+            return "no complete treatment/mediator observations"
+        n_treatment = int(data[treatment].nunique())
+        n_mediator = int(data[mediator].nunique())
+        if n_treatment < 2:
+            return "the treatment has fewer than two observed levels"
+        if n_treatment > MAX_FRONTDOOR_LEVELS:
+            return (
+                f"the treatment has {n_treatment} levels "
+                f"(frontdoor supports at most {MAX_FRONTDOOR_LEVELS})"
+            )
+        if n_mediator > MAX_FRONTDOOR_LEVELS:
+            return (
+                f"the mediator has {n_mediator} levels "
+                f"(frontdoor supports at most {MAX_FRONTDOOR_LEVELS}; continuous mediators "
+                "need a different estimator)"
+            )
+        return None
+
+    def _select_frontdoor(self) -> None:
+        """Select frontdoor adjustment and record what the agent needs to run it."""
+        self.leaf(M_FRONTDOOR)
+        options: Dict[str, Any] = {}
+        if self.props.get("mediator_variable"):
+            options["mediator_variable"] = self.props["mediator_variable"]
+        if self.props.get("treatment_reference_level") is not None:
+            options["treatment_reference_level"] = self.props["treatment_reference_level"]
+        self.result.execution = {
+            "method": M_FRONTDOOR,
+            "display_name": "Frontdoor Adjustment",
+            "options": options,
+        }
+        self.result.warnings.append(
+            "Frontdoor adjustment identifies the effect through the mediator; its "
+            "validity rests on the audit assumptions (full mediation, no T-M confounding, "
+            "T blocks M-Y confounding) reported above."
+        )
+
 
     def _try_backdoor(self, non_binary: bool) -> bool:
         has = self.props.get("has_valid_backdoor_set")
@@ -720,7 +790,7 @@ class _Traversal:
                     "Gate: Positivity", "positivity",
                     "Positivity failed for the generalized propensity score strategy.",
                 ):
-                    self.leaf(M_GPS)
+                    self._select_gps()
                     return True
                 self.end("Positivity failed for the generalized propensity score strategy.")
             else:
@@ -730,7 +800,7 @@ class _Traversal:
             self.result.warnings.append("Positivity could not be tested; continuing with warning.")
 
         if non_binary:
-            self.leaf(M_GPS)
+            self._select_gps()
             return True
 
         # binary: covariate balance chooses between IPW and matching
@@ -797,6 +867,11 @@ class _Traversal:
             f"drop units with propensity score outside [{lo:g}, {hi:g}]",
         )
 
+    def _select_gps(self) -> None:
+        """Select the generalized propensity score (GPS) and plan its advisory post-checks."""
+        self.leaf(M_GPS)
+        self.result.planned_post_checks.extend(["balance_after_gps", "gps_specification"])
+
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -823,7 +898,8 @@ def select_method_v2(
       has_temporal_structure,
       is_encouragement_design, has_pre_treatment_variables,
       has_valid_instrument, has_candidate_mediator, has_valid_backdoor_set,
-      is_structure_supported, anticipation_known_bounded, local_manipulation.
+      is_structure_supported, anticipation_known_bounded, local_manipulation,
+      treatment_reference_level.
 
     ``checks`` wins over ``checks_factory``; when neither is given, the real
     checks are bound via ``build_default_checks``.

@@ -22,6 +22,7 @@ from cais.methods.difference_in_differences.estimator import DiDRegression
 from cais.methods.instrumental_variable.estimator import IVRegression
 from cais.methods.propensity_score.matching import PropensityScoreMatching
 from cais.methods.propensity_score.weighting import TrimmedIPW
+from cais.methods.frontdoor_adjustment.estimator import FrontdoorAdjustment
 from cais.models import Variables, MethodInfo
 from cais.components.assumption_checks import IVTest, ObervationalTest, DiDTest, RDDTest
 from cais.components.decision_tree_v2 import select_method_v2 as run_decision_tree_v2
@@ -41,6 +42,7 @@ REGRESSION_DISCONTINUITY = "regression_discontinuity_design"
 PROPENSITY_SCORE_MATCHING = "propensity_score_matching"
 INSTRUMENTAL_VARIABLE = "instrumental_variable"
 TRIMMED_IPW = "trimmed_ipw"
+FRONTDOOR = "frontdoor_adjustment"
 
 # Temporary name conversion
 convert = {
@@ -50,6 +52,7 @@ convert = {
     INSTRUMENTAL_VARIABLE: IVRegression.name,
     PROPENSITY_SCORE_MATCHING: PropensityScoreMatching.name,
     TRIMMED_IPW: TrimmedIPW.name,
+    FRONTDOOR: FrontdoorAdjustment.name,
 }
 
 os.makedirs('./logs/', exist_ok=True)
@@ -212,6 +215,7 @@ class CausalAgent():
             "is_structure_supported": True,
             "anticipation_known_bounded": False,
             "local_manipulation": False,
+            "treatment_reference_level": getattr(variables, "treatment_reference_level", None),
         }
 
     def select_method_v2(self, query=None, prompt_callback=None):
@@ -269,7 +273,78 @@ class CausalAgent():
             "assumptions": {name: verdict.model_dump() for name, verdict in result.assumptions.items()},
             "concerns": list(result.warnings),
             "planned_post_checks": list(result.planned_post_checks),
+            "post_checks": self._post_check_advisories(),
         }
+
+    # ------------------------------------------------------------------
+    # Advisory post-modeling checks (output only, never blocking)
+    # ------------------------------------------------------------------
+
+    def _results_diagnostics(self) -> Dict[str, Any]:
+        """Diagnostics from the last execution, independent of result nesting."""
+        results = self.results if isinstance(self.results, dict) else {}
+        nested = results.get("results")
+        payload = nested if isinstance(nested, dict) else results
+        diagnostics = payload.get("diagnostics") if isinstance(payload, dict) else None
+        return diagnostics if isinstance(diagnostics, dict) else {}
+
+    def _reported_post_checks(self) -> Dict[str, Any]:
+        """Post-check verdicts the estimator reported in its diagnostics."""
+        reported = self._results_diagnostics().get("post_checks")
+        return dict(reported) if isinstance(reported, dict) else {}
+
+    def _gps_balance_verdict(self) -> Optional[Dict[str, Any]]:
+        """Normalize the GPS estimator's balance diagnostics into a verdict."""
+        balance = self._results_diagnostics().get("balance_check")
+        if not isinstance(balance, dict):
+            return None
+        summary = balance.get("summary_stats") or {}
+        n_imbalanced = summary.get("num_covariates_potentially_imbalanced_p005")
+        if n_imbalanced is None:
+            return {
+                "passed": None,
+                "reasoning": "the GPS diagnostics did not report an imbalance count",
+            }
+        n_imbalanced = int(n_imbalanced)
+        return {
+            "passed": n_imbalanced == 0,
+            "reasoning": (
+                f"{n_imbalanced} covariate(s) potentially imbalanced across GPS strata "
+                "(p < 0.05 heuristic)." if n_imbalanced else
+                "no covariate was flagged as imbalanced across GPS strata (p < 0.05 heuristic)."
+            ),
+        }
+
+    def _post_check_advisories(self) -> List[Dict[str, Any]]:
+        """Verdicts for the advisory post-modeling checks planned by the tree.
+
+        These are output-only: they never change the estimate or stop the run.
+        A planned check the estimator did not report is surfaced as
+        ``passed=None`` ("could not be evaluated") rather than silently dropped.
+        """
+        planned = list(getattr(self.tree_result, "planned_post_checks", []) or [])
+        reported = self._reported_post_checks()
+        advisories: List[Dict[str, Any]] = []
+        for name in planned:
+            verdict = reported.get(name)
+            if verdict is None and name == "balance_after_gps":
+                verdict = self._gps_balance_verdict()
+            if verdict is None and name == "gps_specification":
+                verdict = {
+                    "passed": None,
+                    "reasoning": (
+                        "the GPS model-specification check (residual normality) is not "
+                        "implemented in this version"
+                    ),
+                }
+            if not isinstance(verdict, dict):
+                verdict = {"passed": None, "reasoning": "the estimator did not report this check"}
+            advisories.append({
+                "name": name,
+                "passed": verdict.get("passed"),
+                "reasoning": verdict.get("reasoning") or "",
+            })
+        return advisories
 
     def _tree_stop_output(self) -> Dict[str, Any]:
         """Result for a study the tree refused to hand to an estimator."""
@@ -405,7 +480,8 @@ class CausalAgent():
                         dataset_path=self.cleaned_dataset_path,
                         dataset_analysis=self.dataset_analysis,
                         dataset_description=self.dataset_description,
-                        original_query = query
+                        original_query = query,
+                        method_options=method_options or None,
                     )
             logger.debug(method_executor_input)
             self.results = method_executor_tool.func(

@@ -1,5 +1,7 @@
 # Propensity Score Weighting (IPW) Implementation 
 
+import logging
+
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
@@ -11,6 +13,8 @@ from cais.methods.causal_method import CausalMethod
 from .base import estimate_propensity_scores, format_ps_results, select_propensity_model
 from .diagnostics import assess_weight_distribution, plot_overlap, plot_balance # Import diagnostic functions
 from .llm_assist import determine_optimal_weight_type, determine_optimal_trim_threshold, get_llm_parameters # Import LLM helpers
+
+logger = logging.getLogger(__name__)
 
 # Minimum observations required in each treatment group after trimming.
 # Below this the weighted contrast is too fragile to report.
@@ -59,6 +63,34 @@ def default_trim_bounds() -> tuple:
         return _validate_ps_bounds(bounds)
     except ValueError:
         return 0.1, 0.9
+
+
+def _post_checks_after_weighting(df: pd.DataFrame, treatment: str, outcome: str,
+                                 covariates: List[str], weights: np.ndarray) -> Dict[str, Any]:
+    '''Advisory post-modeling check for IPW: covariate balance after weighting.
+
+    Runs after the estimate is produced, so it never changes the result. The
+    verdict is carried in ``diagnostics["post_checks"]`` and the agent turns it
+    into an affirming/warning sentence in CAIS's output.
+    '''
+    try:
+        from cais.models import AssumptionVariables
+        from cais.methods.post_model_assumption_utils import check_balance_after_weighting
+
+        variables = AssumptionVariables(
+            df=df, treatment=treatment, outcome=outcome, covariates=list(covariates)
+        )
+        verdict = check_balance_after_weighting(variables, np.asarray(weights, dtype=float))
+        return {"balance_after_weighting": verdict.model_dump()}
+    except Exception as exc:  # advisory checks must never break execution
+        logger.warning("Post-check balance_after_weighting could not be evaluated: %s", exc)
+        return {
+            "balance_after_weighting": {
+                "passed": None,
+                "reasoning": f"Post-check could not be evaluated: {exc}",
+                "details": {},
+            }
+        }
 
 
 def estimate_effect(df: pd.DataFrame, treatment: str, outcome: str, 
@@ -227,6 +259,11 @@ def estimate_effect(df: pd.DataFrame, treatment: str, outcome: str,
     # diagnostics.update(weighted_diagnostics)
     diagnostics["propensity_score_model"] = propensity_model_type
     diagnostics["trimming"] = dict(trim_info)
+    # Advisory post-modeling check (surfaced in CAIS's output, never blocking):
+    # did the weights actually balance the observed covariates?
+    diagnostics["post_checks"] = _post_checks_after_weighting(
+        df_analysis, treatment, outcome, covariates, df_analysis['ipw'].to_numpy()
+    )
 
     # --- Step 7: Format and return results --- 
     return format_ps_results(effect, effect_se, diagnostics,

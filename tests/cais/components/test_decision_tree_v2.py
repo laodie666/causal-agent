@@ -636,14 +636,49 @@ class TestOptions(unittest.TestCase):
         self.assertTrue(res.ended)
         self.assertIn("Weak instrument", res.end_reason)
 
-    def test_mediator_selects_frontdoor_placeholder(self):
-        res = run(base_props(mediator_variable="m"))
+    def test_mediator_selects_frontdoor_adjustment(self):
+        res = run(base_props(mediator_variable="m", treatment_reference_level=0))
         self.assertEqual(res.method, M_FRONTDOOR)
-        self.assertFalse(res.implemented)
+        self.assertTrue(res.implemented)
+        self.assertEqual(res.execution["method"], M_FRONTDOOR)
+        self.assertEqual(res.execution["display_name"], "Frontdoor Adjustment")
+        self.assertEqual(res.execution["options"]["mediator_variable"], "m")
+        self.assertEqual(res.execution["options"]["treatment_reference_level"], 0)
+        self.assertTrue(any("frontdoor" in w.lower() for w in res.warnings))
 
     def test_mediator_positivity_fail_ends(self):
-        res = run(base_props(mediator_variable="m"), checks=stub_checks(positivity=False))
+        res = run(base_props(mediator_variable="m"),
+                  checks=stub_checks(frontdoor_positivity=False))
         self.assertTrue(res.ended)
+        self.assertIn("frontdoor", res.end_reason.lower())
+
+    def test_frontdoor_unusable_mediator_falls_back_to_backdoor(self):
+        # 12 distinct mediator values -> beyond the frontdoor level cap.
+        df = pd.DataFrame({
+            "treatment": [0, 1] * 6,
+            "mediator": [round(0.05 + 0.08 * i, 2) for i in range(12)],
+            "outcome": [1.0 + 0.2 * i for i in range(12)],
+            "x1": [round(0.05 + 0.07 * i, 2) for i in range(12)],
+        })
+        res = run(base_props(mediator_variable="mediator"), checks=stub_checks(), df=df)
+        self.assertEqual(res.method, M_IPW)
+        self.assertFalse(res.ended)
+        self.assertTrue(any("frontdoor" in w.lower() and "continuing to the backdoor" in w.lower()
+                            for w in res.warnings))
+
+    def test_frontdoor_continuous_treatment_falls_back_to_gps(self):
+        df = pd.DataFrame({
+            "treatment": [0.1, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            "mediator": [0, 1, 0, 1, 0, 1, 0, 1],
+            "outcome": [1.0, 2.0, 1.5, 2.5, 1.8, 2.8, 2.1, 3.1],
+            "x1": [0.1, 0.3, 0.2, 0.4, 0.5, 0.6, 0.7, 0.8],
+        })
+        res = run(
+            base_props(mediator_variable="mediator", treatment_variable_type="continuous"),
+            checks=stub_checks(),
+            df=df,
+        )
+        self.assertEqual(res.method, M_GPS)
 
     def test_backdoor_balanced_selects_ipw(self):
         res = run(base_props(), checks=stub_checks(cond_ignorability=True, positivity=True))
@@ -699,6 +734,8 @@ class TestOptions(unittest.TestCase):
     def test_nonbinary_backdoor_selects_gps(self):
         res = run(base_props(treatment_variable_type="continuous", covariates=["x1"]))
         self.assertEqual(res.method, M_GPS)
+        # The graph's GPS branch carries post-check advisories (balance, specification).
+        self.assertEqual(res.planned_post_checks, ["balance_after_gps", "gps_specification"])
 
     def test_nonbinary_positivity_fail_ends(self):
         res = run(

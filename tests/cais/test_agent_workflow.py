@@ -188,12 +188,66 @@ class TestDecisionTreeV2Wiring(unittest.TestCase):
 
         info = agent._tree_validation_info()
 
-        for key in ("method", "variant", "path", "steps", "assumptions", "concerns", "planned_post_checks"):
+        for key in ("method", "variant", "path", "steps", "assumptions", "concerns",
+                    "planned_post_checks", "post_checks"):
             self.assertIn(key, info)
         self.assertEqual(info["method"], "propensity_score_matching")
         self.assertEqual(info["assumptions"]["positivity"]["passed"], True)
         self.assertIn("SUTVA could not be assessed (advisory).", info["concerns"])
         self.assertEqual(info["planned_post_checks"], ["balance_after_matching"])
+
+    def test_validation_info_includes_post_check_advisories(self):
+        agent = self._make_agent()
+        agent.tree_result = TreeResult(
+            method="propensity_score_matching",
+            planned_post_checks=["balance_after_matching", "gps_specification"],
+        )
+        agent.results = {
+            "effect_estimate": 1.0,
+            "diagnostics": {
+                "post_checks": {
+                    "balance_after_matching": {
+                        "passed": False,
+                        "reasoning": "Still imbalanced: ['x1'].",
+                    }
+                }
+            },
+        }
+
+        info = agent._tree_validation_info()
+
+        checks = info["post_checks"]
+        self.assertEqual([item["name"] for item in checks],
+                         ["balance_after_matching", "gps_specification"])
+        self.assertFalse(checks[0]["passed"])
+        self.assertIn("Still imbalanced", checks[0]["reasoning"])
+        # Planned but unevaluated checks are surfaced as "could not be evaluated".
+        self.assertIsNone(checks[1]["passed"])
+        self.assertTrue(checks[1]["reasoning"])
+
+    def test_post_check_advisories_read_nested_fallback_results(self):
+        agent = self._make_agent()
+        agent.tree_result = TreeResult(
+            method="propensity_score_weighting",
+            planned_post_checks=["balance_after_weighting"],
+        )
+        agent.results = {
+            "results": {
+                "diagnostics": {
+                    "post_checks": {
+                        "balance_after_weighting": {
+                            "passed": True,
+                            "reasoning": "All balanced after IPW.",
+                        }
+                    }
+                }
+            }
+        }
+
+        info = agent._tree_validation_info()
+
+        self.assertTrue(info["post_checks"][0]["passed"])
+        self.assertIn("All balanced after IPW", info["post_checks"][0]["reasoning"])
 
     def test_tree_stop_output_for_gate_failure(self):
         agent = self._make_agent()
@@ -219,15 +273,15 @@ class TestDecisionTreeV2Wiring(unittest.TestCase):
     def test_tree_stop_output_for_unimplemented_leaf(self):
         agent = self._make_agent()
         agent.tree_result = TreeResult(
-            method="frontdoor_adjustment",
+            method="donut_rdd",
             implemented=False,
-            warnings=["frontdoor_adjustment is not implemented yet; this study cannot be estimated."],
-            steps=[TreeStep("frontdoor_adjustment", "leaf", "selected (not implemented)")],
+            warnings=["donut_rdd is not implemented yet; this study cannot be estimated."],
+            steps=[TreeStep("donut_rdd", "leaf", "selected (not implemented)")],
         )
 
         output = agent._tree_stop_output()
 
-        self.assertIn("frontdoor_adjustment is not implemented yet", output["explanation"])
+        self.assertIn("donut_rdd is not implemented yet", output["explanation"])
 
     @patch('cais.agent.run_decision_tree_v2')
     def test_run_analysis_stops_before_controls_and_execution(self, mock_tree):
@@ -331,6 +385,14 @@ class TestDecisionTreeV2Wiring(unittest.TestCase):
 
         self.assertEqual(convert["trimmed_ipw"], TrimmedIPW.name)
         self.assertIn(TrimmedIPW.name, Estimators().estimators)
+
+    def test_frontdoor_is_registered_for_execution(self):
+        from cais.agent import convert
+        from cais.estimator_lib import Estimators
+        from cais.methods.frontdoor_adjustment.estimator import FrontdoorAdjustment
+
+        self.assertEqual(convert["frontdoor_adjustment"], FrontdoorAdjustment.name)
+        self.assertIn(FrontdoorAdjustment.name, Estimators().estimators)
 
 
 if __name__ == '__main__':
